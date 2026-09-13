@@ -2,6 +2,7 @@ import asyncio
 import os
 import html
 import random
+import time
 from collections import Counter
 
 from aiogram import Bot, Dispatcher, F
@@ -203,6 +204,10 @@ def bot_id(chat_id: int, index: int) -> int:
     return -10_000_000_000 - (abs(chat_id) * 100 + index)
 
 
+def is_bot_user(user_id: int) -> bool:
+    return user_id < 0
+
+
 def sync_bots(game: Game, count: int):
     humans = [uid for uid in game.players if uid > 0]
     count = max(0, min(int(count), 12 - len(humans)))
@@ -369,15 +374,15 @@ async def start_handler(message: Message):
             target_game = games.get(int(argument.split("_", 1)[1]))
         except ValueError:
             pass
-    await message.answer(
-        "🎭 <b>MAFIA</b>\n\n"
-        "Личный игровой интерфейс открыт.\n"
-        "Секретные действия и результаты видны только вам.",
-        reply_markup=private_bot_keyboard(me.username),
-        parse_mode="HTML",
-    )
     if target_game and target_game.started and message.from_user.id in target_game.alive and target_game.phase == "night":
         await send_current_private_action(bot, target_game, message.from_user.id)
+        return
+    await message.answer(
+        "🎭 <b>MAFIA</b>\n\n"
+        "Личный игровой режим активирован.\n"
+        "Секретные действия и результаты видны только вам.",
+        parse_mode="HTML",
+    )
 
 
 @dp.callback_query(F.data == "private_launch")
@@ -551,8 +556,9 @@ async def start_game_handler(callback: CallbackQuery, bot: Bot):
     if game.started:
         await callback.answer("🌙 Игра уже идёт.", show_alert=True); return
     game.start()
+    game.assign_roles()
     await callback.message.edit_text(
-        f"🎭 <b>ИГРА НАЧИНАЕТСЯ</b>\n\n👥 Игроков: <b>{len(game.players)}</b>\n\n🔒 Роли и ночные действия не публикуются.",
+        "🎭 <b>РОЛИ РАСПРЕДЕЛЕНЫ</b>",
         reply_markup=admin_game_keyboard(chat_id, BOT_USERNAME), parse_mode="HTML")
     game_messages[chat_id] = callback.message.message_id
     game_message_ids.setdefault(chat_id, set()).add(callback.message.message_id)
@@ -568,8 +574,6 @@ async def start_game_task(bot: Bot, game: Game):
 
 async def run_game(bot: Bot, game: Game):
     try:
-        game.assign_roles()
-        await send_game_message(bot, game, "🎲 <b>РОЛИ РАСПРЕДЕЛЕНЫ</b>\n\n🔒 Каждый игрок получил свою секретную роль.\n\n🌙 <b>ГОРОД ЗАСЫПАЕТ</b>", parse_mode="HTML")
         await asyncio.sleep(1)
         while game.started:
             winner = game.winner()
@@ -696,6 +700,12 @@ async def run_night(bot: Bot, game: Game):
     if not game.started: return
     deaths = resolve_night(game)
 
+    # Причина убийства в группе, подробности — только в личном чате.
+    if game.mafia_kill_target is not None and game.mafia_kill_target in deaths:
+        await send_game_message(bot, game, f"🔴 <b>{safe_name(game, game.mafia_kill_target)}</b> убит(а) мафией.", parse_mode="HTML")
+    if game.commissioner_kill_target is not None and game.commissioner_kill_target in deaths:
+        await send_game_message(bot, game, f"🔴 <b>{safe_name(game, game.commissioner_kill_target)}</b> убит(а) комиссаром.", parse_mode="HTML")
+
     # Секретные уведомления участникам: причина смерти и факт лечения.
     if game.doctor_target is not None:
         try:
@@ -755,16 +765,38 @@ async def run_last_word(bot: Bot, game: Game, player_id: int):
     game.phase = "last_word"; game.last_word_player = player_id; game.last_word_text = None; game.action_event.clear()
     await update_main_game_message(bot, game)
     await send_game_message(bot, game, f"🔴 <b>ПОСЛЕДНЕЕ СЛОВО</b>\n\n<b>{safe_name(game, player_id)}</b> может написать последнее слово.\n\n⏱ {game.last_word_seconds} сек.", parse_mode="HTML")
-    try: await asyncio.wait_for(game.action_event.wait(), timeout=game.last_word_seconds)
-    except asyncio.TimeoutError: pass
-    game.last_word_used.add(player_id); game.last_word_player = None
+    try:
+        await asyncio.wait_for(game.action_event.wait(), timeout=game.last_word_seconds)
+    except asyncio.TimeoutError:
+        pass
+    except Exception as error:
+        print(f"⚠️ Ошибка последнего слова {game.chat_id}: {error}")
+    finally:
+        game.last_word_used.add(player_id)
+        game.last_word_player = None
+
+
+async def run_countdown_message(bot: Bot, game: Game, message, title: str, seconds: int, footer: str = ""):
+    deadline = time.monotonic() + max(0, seconds)
+    while game.started:
+        remaining = max(0, int(deadline - time.monotonic() + 0.999))
+        minutes, secs = divmod(remaining, 60)
+        timer = f"⏱ <b>{minutes:02d}:{secs:02d}</b>"
+        text = f"{title}\n\n{timer}" + (f"\n\n{footer}" if footer else "")
+        try:
+            await bot.edit_message_text(chat_id=game.chat_id, message_id=message.message_id, text=text, parse_mode="HTML", reply_markup=message.reply_markup)
+        except Exception:
+            pass
+        if remaining <= 0:
+            break
+        await asyncio.sleep(1)
 
 
 async def run_day(bot: Bot, game: Game):
     game.day_number += 1; game.phase = "day_discussion"
     await update_main_game_message(bot, game)
-    await send_game_message(bot, game, f"☀️ <b>ДЕНЬ</b>\n\n💬 <b>ОБСУЖДЕНИЕ</b>\n\nОбсуждение длится <b>{game.discussion_seconds // 60} мин.</b>", parse_mode="HTML")
-    await asyncio.sleep(game.discussion_seconds)
+    message = await send_game_message(bot, game, "☀️ <b>ДЕНЬ</b>\n\n💬 <b>ОБСУЖДЕНИЕ</b>", parse_mode="HTML")
+    await run_countdown_message(bot, game, message, "☀️ <b>ДЕНЬ</b>\n\n💬 <b>ОБСУЖДЕНИЕ</b>", game.discussion_seconds)
     if not game.started: return
     await conduct_vote(bot, game, None)
 
@@ -785,6 +817,23 @@ def get_vote_live_text(game: Game, candidates: list[int]) -> str:
     return "\n".join(lines)
 
 
+async def send_private_vote_prompts(bot: Bot, game: Game, candidates: list[int]):
+    # В личном чате список кандидатов персональный: своё имя здесь не показывается.
+    for voter in game.alive_players():
+        if is_bot_user(voter):
+            continue
+        choices = [(uid, game.player_names.get(uid, "Игрок")) for uid in candidates if uid in game.alive and uid != voter]
+        if not choices:
+            continue
+        try:
+            await send_private_game_message(
+                bot, game, voter,
+                "🗳 <b>ГОЛОСОВАНИЕ</b>\n\nВыберите игрока, затем нажмите «ПОДТВЕРДИТЬ ГОЛОС».\n\n⏱ <b>10 секунд</b>",
+                reply_markup=vote_keyboard(game.chat_id, choices), parse_mode="HTML")
+        except Exception:
+            pass
+
+
 async def conduct_vote(bot: Bot, game: Game, candidates: list[int] | None):
     game.phase = "day_vote"; game.reset_day_votes()
     alive = game.alive_players()
@@ -800,21 +849,38 @@ async def conduct_vote(bot: Bot, game: Game, candidates: list[int] | None):
         bot, game, get_vote_live_text(game, ids),
         reply_markup=vote_keyboard(game.chat_id, players), parse_mode="HTML")
     game.vote_message_id = vote_message.message_id
-    game.action_event.clear()
-    try: await asyncio.wait_for(game.action_event.wait(), timeout=game.vote_seconds)
-    except asyncio.TimeoutError: pass
+    await send_private_vote_prompts(bot, game, ids)
+    deadline = time.monotonic() + 10
+    game.vote_deadline = deadline
+    while game.started:
+        remaining = max(0, int(deadline - time.monotonic() + 0.999))
+        minutes, secs = divmod(remaining, 60)
+        try:
+            await bot.edit_message_text(
+                chat_id=game.chat_id, message_id=vote_message.message_id,
+                text=get_vote_live_text(game, ids) + f"\n\n⏱ <b>00:{secs:02d}</b>",
+                reply_markup=vote_keyboard(game.chat_id, players), parse_mode="HTML")
+        except Exception:
+            pass
+        if game.all_day_votes_complete() or remaining <= 0:
+            break
+        await asyncio.sleep(1)
     alive = game.alive_players()
     for voter in alive:
         if voter not in game.day_votes:
+            selected = game.day_vote_selection.get(voter)
             choices = [uid for uid in ids if uid in game.alive and uid != voter]
-            if choices: game.day_votes[voter] = random.choice(choices)
+            if selected in choices:
+                game.day_votes[voter] = selected
+            elif choices:
+                game.day_votes[voter] = random.choice(choices)
     await publish_vote_results(bot, game)
     counts = Counter(game.day_votes.values())
     if not counts: return
     high = max(counts.values()); leaders = [uid for uid, c in counts.items() if c == high]
     if len(leaders) > 1 and candidates is None:
         game.tie_candidates = leaders
-        await send_game_message(bot, game, "⚖️ <b>НИЧЬЯ</b>\n\nРешающее голосование между двумя игроками.", parse_mode="HTML")
+        await send_game_message(bot, game, "⚖️ <b>НИЧЬЯ</b>\n\nРешающее голосование между лидерами.", reply_markup=bot_chat_keyboard(), parse_mode="HTML")
         await conduct_vote(bot, game, leaders)
         return
     if len(leaders) > 1:
@@ -828,6 +894,14 @@ async def conduct_vote(bot: Bot, game: Game, candidates: list[int] | None):
     await run_last_word(bot, game, eliminated)
 
 
+def bot_chat_keyboard():
+    if not BOT_USERNAME:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="💬 ПЕРЕЙТИ В ЧАТ С БОТОМ", url=f"https://t.me/{BOT_USERNAME}")
+    ]])
+
+
 async def publish_vote_results(bot: Bot, game: Game):
     lines = ["🗳 <b>РЕЗУЛЬТАТЫ ГОЛОСОВАНИЯ</b>", ""]
     for voter, target in game.day_votes.items():
@@ -836,7 +910,7 @@ async def publish_vote_results(bot: Bot, game: Game):
     counts = Counter(game.day_votes.values())
     for uid, count in counts.most_common():
         lines.append(f"{safe_name(game, uid)} — <b>{count}</b>")
-    await send_game_message(bot, game, "\n".join(lines), parse_mode="HTML")
+    await send_game_message(bot, game, "\n".join(lines), reply_markup=bot_chat_keyboard(), parse_mode="HTML")
 
 
 @dp.callback_query(F.data.startswith("mafia_target:"))
@@ -951,21 +1025,44 @@ async def cancel_action_handler(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("vote:"))
 async def vote_handler(callback: CallbackQuery):
-    try: _, chat_s, target_s=callback.data.split(":"); chat_id=int(chat_s); target_id=int(target_s)
-    except Exception: await callback.answer("❌ Некорректное голосование.", show_alert=True); return
-    game=games.get(chat_id); voter=callback.from_user.id
-    if not game or game.phase!="day_vote" or voter not in game.alive or target_id not in game.alive or target_id==voter:
+    try: _, chat_s, target_s = callback.data.split(":"); chat_id = int(chat_s); target_id = int(target_s)
+    except Exception:
+        await callback.answer("❌ Некорректное голосование.", show_alert=True); return
+    game = games.get(chat_id); voter = callback.from_user.id
+    if not game or game.phase != "day_vote" or voter not in game.alive or target_id not in game.alive:
         await callback.answer("❌ Голосование недоступно.", show_alert=True); return
-    game.day_votes[voter]=target_id
-    if callback.message:
+    if target_id == voter:
+        await callback.answer("❌ За себя голосовать нельзя.", show_alert=True); return
+    game.day_vote_selection[voter] = target_id
+    await callback.answer(f"Вы выбрали: {game.player_names.get(target_id, 'Игрок')}. Теперь нажмите «ПОДТВЕРДИТЬ ГОЛОС». ", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("vote_confirm:"))
+async def vote_confirm_handler(callback: CallbackQuery, bot: Bot):
+    try: chat_id = int(callback.data.split(":")[1])
+    except Exception:
+        await callback.answer("❌ Некорректное голосование.", show_alert=True); return
+    game = games.get(chat_id); voter = callback.from_user.id
+    if not game or game.phase != "day_vote" or voter not in game.alive:
+        await callback.answer("❌ Голосование недоступно.", show_alert=True); return
+    target_id = game.day_vote_selection.get(voter)
+    if target_id is None:
+        await callback.answer("Сначала выберите игрока.", show_alert=True); return
+    if target_id == voter or target_id not in game.alive:
+        await callback.answer("❌ Этот выбор недоступен.", show_alert=True); return
+    game.day_votes[voter] = target_id
+    candidates = [uid for uid in (game.tie_candidates or game.alive_players()) if uid in game.alive]
+    if game.vote_message_id:
         try:
-            candidates = [uid for uid in (game.tie_candidates or game.alive_players()) if uid in game.alive]
-            await callback.message.edit_text(
-                get_vote_live_text(game, candidates),
-                reply_markup=vote_keyboard(chat_id, [(uid, game.player_names.get(uid, "Игрок")) for uid in candidates]),
-                parse_mode="HTML")
-        except Exception: pass
-    await callback.answer(f"🗳 Вы проголосовали за {game.player_names.get(target_id,'Игрок')}")
+            players = [(uid, game.player_names.get(uid, "Игрок")) for uid in candidates]
+            remaining = max(0, int(getattr(game, "vote_deadline", time.monotonic()) - time.monotonic() + 0.999))
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=game.vote_message_id,
+                text=get_vote_live_text(game, candidates) + f"\n\n⏱ <b>00:{remaining:02d}</b>",
+                reply_markup=vote_keyboard(chat_id, players), parse_mode="HTML")
+        except Exception:
+            pass
+    await callback.answer(f"✅ Голос подтверждён: {game.player_names.get(target_id, 'Игрок')}")
     if game.all_day_votes_complete(): game.action_event.set()
 
 
@@ -984,8 +1081,12 @@ async def postgame_new_handler(callback: CallbackQuery, bot: Bot):
         await callback.answer("⚠️ Только администратор.",show_alert=True); return
     old=games.get(chat_id)
     if not old: return
+    task=game_tasks.get(chat_id)
+    if task and not task.done(): task.cancel()
     await cleanup_game_messages(bot,chat_id)
     old.reset_to_lobby(False)
+    game_tasks.pop(chat_id, None)
+    games[chat_id]=old
     lobby = await bot.send_message(chat_id,get_lobby_text(old),reply_markup=lobby_keyboard(True,False),parse_mode="HTML")
     game_messages[chat_id]=lobby.message_id; game_message_ids.setdefault(chat_id,set()).add(lobby.message_id)
     await callback.answer("🎮 Новое лобби готово.")
