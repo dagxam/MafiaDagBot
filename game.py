@@ -19,7 +19,7 @@ class Game:
     def can_start(self):return len(self.players)>=self.MIN_PLAYERS
     def start(self):
         if not self.can_start():return False
-        self.started=True;self.phase="starting";self.night_number=0;self.day_number=0;self.last_word_used.clear();self.doctor_healed.clear();self.last_word_player=None;self.last_word_text=None;return True
+        self.started=True;self.phase="starting";self.night_number=0;self.day_number=0;self.last_word_used.clear();self.doctor_healed.clear();self.last_word_player=None;self.last_word_text=None;self.action_event.clear();return True
     def restart(self):
         if not self.can_start():return False
         self.roles.clear();self.alive.clear();self.last_word_used.clear();self.doctor_healed.clear();self.last_word_player=None;self.last_word_text=None;self.mafia_votes.clear();self.doctor_target=None;self.commissioner_target=None;self.commissioner_kill_target=None;self.day_votes.clear();self.day_vote_selection.clear();self.vote_message_id=None;self.tie_candidates.clear();self.action_event.clear();self.night_number=0;self.day_number=0;self.started=True;self.phase="starting";return True
