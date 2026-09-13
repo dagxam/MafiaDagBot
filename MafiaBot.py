@@ -693,23 +693,21 @@ async def run_night(bot: Bot, game: Game):
         reply_markup=bot_chat_keyboard(), parse_mode="HTML")
 
     await _open_night_actions(bot, game)
-    deadline = time.monotonic() + 15
+    # Один общий таймер ночи. Ждём либо полного выбора всех ночных ролей,
+    # либо истечения 15 секунд. После этого игровой цикл всегда продолжается.
     timer_task = asyncio.create_task(run_night_phase_timer(bot, game, night_message, 15))
     try:
-        while game.started:
-            if game.night_actions_complete():
-                break
-            remaining = max(0, deadline - time.monotonic())
-            if remaining <= 0:
-                break
-            await asyncio.sleep(min(0.2, remaining))
+        try:
+            await asyncio.wait_for(game.action_event.wait(), timeout=15)
+        except asyncio.TimeoutError:
+            pass
     finally:
         if not timer_task.done():
             timer_task.cancel()
-            try:
-                await timer_task
-            except asyncio.CancelledError:
-                pass
+        try:
+            await timer_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
     # Всё, что не выбрано людьми к дедлайну, выбирается автоматически, чтобы цикл никогда не зависал.
     await _resolve_bot_night_actions(game)
@@ -1018,9 +1016,8 @@ async def handle_private_target(callback: CallbackQuery, role: str):
     if callback.message:
         await callback.message.delete()
     await callback.answer(("🔫 ВЫ ВЫБРАЛИ ЖЕРТВУ: " if role == MAFIA else "💊 ВЫ ВЫБРАЛИ ДЛЯ ЛЕЧЕНИЯ: ") + name, show_alert=True)
-    if role == MAFIA:
-        if len(game.mafia_votes) >= len(game.alive_mafia()): game.action_event.set()
-    else: game.action_event.set()
+    if game.night_actions_complete():
+        game.action_event.set()
 
 
 @dp.callback_query(F.data.startswith("night_commissioner:"))
@@ -1065,7 +1062,8 @@ async def commissioner_target_handler(callback: CallbackQuery, bot: Bot):
     game.commissioner_target=target_id
     result={MAFIA:"🔴 МАФИЯ", DOCTOR:"💊 ДОКТОР", COMMISSIONER:"🔎 КОМИССАР"}.get(game.roles.get(target_id),"🟢 МИРНЫЙ ЖИТЕЛЬ")
     if callback.message: await callback.message.delete()
-    game.action_event.set()
+    if game.night_actions_complete():
+        game.action_event.set()
     await callback.answer(f"🔎 ВЫ ПРОВЕРИЛИ: {safe_name(game,target_id)}\n\nРезультат: {result}", show_alert=True)
 
 
@@ -1081,7 +1079,8 @@ async def commissioner_kill_handler(callback: CallbackQuery, bot: Bot):
         await callback.answer("❌ Вы уже выбрали проверку. Комиссар может сделать только одно действие за ночь.", show_alert=True); return
     game.commissioner_kill_target=target_id
     if callback.message: await callback.message.delete()
-    game.action_event.set()
+    if game.night_actions_complete():
+        game.action_event.set()
     await callback.answer(f"☠️ ВЫ ВЫБРАЛИ ДЛЯ УБИЙСТВА: {safe_name(game,target_id)}", show_alert=True)
 
 
