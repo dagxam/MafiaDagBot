@@ -41,6 +41,7 @@ class Game:
     day_number: int = 0
     last_word_player: int | None = None
     last_word_text: str | None = None
+    last_word_user: int | None = None
     mafia_votes: dict[int, int] = field(default_factory=dict)
     doctor_target: int | None = None
     commissioner_target: int | None = None
@@ -48,6 +49,7 @@ class Game:
     day_votes: dict[int, int] = field(default_factory=dict)
     tie_candidates: list[int] = field(default_factory=list)
     action_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    last_word_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     discussion_seconds: int = 120
     night_seconds: int = 120
     last_word_seconds: int = 30
@@ -73,6 +75,7 @@ class Game:
         self.last_word_used.clear()
         self.doctor_healed.clear()
         self.last_word_player = None
+        self.last_word_user = None
         self.last_word_text = None
         return True
 
@@ -84,6 +87,7 @@ class Game:
         self.last_word_used.clear()
         self.doctor_healed.clear()
         self.last_word_player = None
+        self.last_word_user = None
         self.last_word_text = None
         self.mafia_votes.clear()
         self.doctor_target = None
@@ -92,6 +96,7 @@ class Game:
         self.day_votes.clear()
         self.tie_candidates.clear()
         self.action_event.clear()
+        self.last_word_event.clear()
         self.night_number = 0
         self.day_number = 0
         self.started = True
@@ -106,6 +111,7 @@ class Game:
         self.last_word_used.clear()
         self.doctor_healed.clear()
         self.last_word_player = None
+        self.last_word_user = None
         self.last_word_text = None
         self.mafia_votes.clear()
         self.doctor_target = None
@@ -114,6 +120,7 @@ class Game:
         self.day_votes.clear()
         self.tie_candidates.clear()
         self.action_event.set()
+        self.last_word_event.set()
         self.night_number = 0
         self.day_number = 0
         if not keep_players:
@@ -124,6 +131,7 @@ class Game:
         self.started = False
         self.phase = "stopped"
         self.action_event.set()
+        self.last_word_event.set()
 
     def alive_players(self) -> list[int]:
         return [uid for uid in self.players if uid in self.alive]
@@ -149,6 +157,10 @@ class Game:
         self.commissioner_target = None
         self.commissioner_kill_target = None
         self.action_event.clear()
+
+    # Compatibility alias used by the bot's night loop.
+    def reset_night(self):
+        self.reset_night_actions()
 
     def reset_day_votes(self):
         self.day_votes.clear()
