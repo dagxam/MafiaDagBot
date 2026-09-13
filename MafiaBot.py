@@ -5,7 +5,7 @@ import random
 from collections import Counter
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (Message, CallbackQuery, ChatMemberUpdated, FSInputFile, InputProfilePhotoStatic,
     BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats)
 from aiogram.enums import ChatType, ChatMemberStatus
@@ -192,6 +192,131 @@ async def setup_bot_avatar(bot: Bot):
     except Exception as error:
         print(f"⚠️ Не удалось установить аватар: {error}")
 
+
+
+# =========================
+# COMMANDS: GROUP / PRIVATE
+# =========================
+
+async def create_lobby_for_group(bot: Bot, message: Message):
+    chat_id = message.chat.id
+    uid = message.from_user.id
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return False
+    if not await is_group_admin(bot, chat_id, uid):
+        await message.reply("⚠️ <b>Только администратор группы может начать игру.</b>", parse_mode="HTML")
+        return False
+    current = games.get(chat_id)
+    if current and current.started:
+        await message.reply("⚠️ <b>Игра уже идёт.</b>", parse_mode="HTML")
+        return False
+    if current and current.players:
+        await message.reply("⚠️ <b>Лобби уже открыто.</b>\n\nПрисоединяйтесь через кнопку <b>🎮 Я ИГРАЮ</b>.", parse_mode="HTML")
+        return False
+    await cleanup_game_messages(bot, chat_id)
+    game = Game(chat_id=chat_id, creator_id=uid, group_title=message.chat.title or "MAFIA")
+    games[chat_id] = game
+    lobby = await bot.send_message(chat_id, get_lobby_text(game), reply_markup=lobby_keyboard(True, False), parse_mode="HTML")
+    game_messages[chat_id] = lobby.message_id
+    game_message_ids.setdefault(chat_id, set()).add(lobby.message_id)
+    return True
+
+@dp.message(Command("mafia"))
+async def mafia_command(message: Message, bot: Bot):
+    await create_lobby_for_group(bot, message)
+
+@dp.message(Command("stop"))
+async def stop_command(message: Message, bot: Bot):
+    if message.chat.type == ChatType.PRIVATE:
+        await message.answer("⏹ Личный режим остановлен.")
+        return
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    chat_id = message.chat.id
+    if not await is_group_admin(bot, chat_id, message.from_user.id):
+        await message.reply("⚠️ <b>Только администратор группы.</b>", parse_mode="HTML")
+        return
+    task = game_tasks.get(chat_id)
+    if task and not task.done():
+        task.cancel()
+    game = games.get(chat_id)
+    if game:
+        game.stop()
+    await cleanup_game_messages(bot, chat_id)
+    games.pop(chat_id, None)
+    welcome = await bot.send_message(chat_id, get_welcome_text(message.chat.title or "MAFIA"), reply_markup=admin_start_keyboard(), parse_mode="HTML")
+    game_messages[chat_id] = welcome.message_id
+    game_message_ids.setdefault(chat_id, set()).add(welcome.message_id)
+
+@dp.message(Command("restart"))
+async def restart_command(message: Message, bot: Bot):
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    chat_id = message.chat.id
+    if not await is_group_admin(bot, chat_id, message.from_user.id):
+        await message.reply("⚠️ <b>Только администратор группы.</b>", parse_mode="HTML")
+        return
+    game = games.get(chat_id)
+    if not game:
+        await message.reply("❌ Нет игры. Используйте <b>/mafia</b>.", parse_mode="HTML")
+        return
+    if not game.can_start():
+        await message.reply("❌ Для запуска нужно минимум <b>4 игрока</b>.", parse_mode="HTML")
+        return
+    task = game_tasks.get(chat_id)
+    if task and not task.done():
+        task.cancel()
+    await cleanup_game_messages(bot, chat_id)
+    game.restart()
+    restart_message = await bot.send_message(chat_id, f"🔄 <b>ИГРА ПЕРЕЗАПУСКАЕТСЯ</b>\n\n👥 Игроков: <b>{len(game.players)}</b>\n\n🎲 Роли будут распределены заново.", reply_markup=admin_game_keyboard(chat_id, BOT_USERNAME), parse_mode="HTML")
+    game_messages[chat_id] = restart_message.message_id
+    game_message_ids.setdefault(chat_id, set()).add(restart_message.message_id)
+    await start_game_task(bot, game)
+
+@dp.message(Command("reset"))
+async def reset_command(message: Message):
+    if message.chat.type == ChatType.PRIVATE:
+        await message.answer("♻️ <b>Личный режим сброшен.</b>\n\nНажмите /start для повторной активации.", parse_mode="HTML")
+
+@dp.message(Command("bots"))
+async def bots_command(message: Message, bot: Bot):
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    chat_id = message.chat.id
+    if not await is_group_admin(bot, chat_id, message.from_user.id):
+        await message.reply("⚠️ <b>Только администратор группы.</b>", parse_mode="HTML")
+        return
+    game = games.get(chat_id)
+    if game and game.started:
+        await message.reply("⚠️ Настройка ботов доступна только до начала игры.", parse_mode="HTML")
+        return
+    count = getattr(game, "bot_count", 0) if game else 0
+    difficulty = getattr(game, "bot_difficulty", "medium") if game else "medium"
+    labels = {"easy":"🟢 Легко", "medium":"🟡 Средне", "hard":"🔴 Сложно"}
+    await message.answer(f"🤖 <b>БОТЫ</b>\n\nКоличество: <b>{count}</b>\nСложность: <b>{labels.get(difficulty, difficulty)}</b>\n\nДля изменения используйте кнопку <b>🤖 БОТЫ</b> в лобби.", parse_mode="HTML")
+
+@dp.message(Command("bots_off"))
+async def bots_off_command(message: Message, bot: Bot):
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    chat_id = message.chat.id
+    if not await is_group_admin(bot, chat_id, message.from_user.id):
+        await message.reply("⚠️ <b>Только администратор группы.</b>", parse_mode="HTML")
+        return
+    game = games.get(chat_id)
+    if game and game.started:
+        await message.reply("⚠️ Игра уже началась.", parse_mode="HTML")
+        return
+    if game:
+        game.bot_count = 0
+        for uid in list(game.players):
+            if uid < 0:
+                game.players.remove(uid)
+                game.player_names.pop(uid, None)
+                if hasattr(game, "player_usernames"):
+                    game.player_usernames.pop(uid, None)
+        await update_main_game_message(bot, game)
+    await message.reply("🤖 <b>Боты отключены.</b>", parse_mode="HTML")
 
 @dp.message(CommandStart())
 async def start_handler(message: Message):
