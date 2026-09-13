@@ -15,14 +15,37 @@ except ImportError:
 
 from game import Game, MAFIA, DOCTOR, COMMISSIONER, ROLE_NAMES, ROLE_DESCRIPTIONS
 from keyboards import lobby_keyboard, admin_start_keyboard, admin_game_keyboard, target_keyboard, vote_keyboard, night_action_keyboard, private_bot_keyboard, postgame_keyboard
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+# Локальные игровые клавиатуры. Они переопределяют старые функции из keyboards.py.
+def admin_game_keyboard(chat_id=None, bot_username=None):
+    buttons=[]
+    if chat_id is not None:
+        buttons.append([InlineKeyboardButton(text="🎭 МОЯ РОЛЬ",callback_data=f"my_role:{chat_id}")])
+        if bot_username: buttons.append([InlineKeyboardButton(text="🎭 МОЙ НОЧНОЙ ХОД",url=f"https://t.me/{bot_username}?start=game_{chat_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def vote_keyboard(chat_id,players,selected_id=None,tie_only=False):
+    buttons=[]
+    for uid,name in players:
+        display=name if len(name)<=28 else name[:25]+"..."; marker="🔘 " if selected_id==uid else ""
+        buttons.append([InlineKeyboardButton(text=f"{marker}🗳 {display}",callback_data=f"vote_select:{chat_id}:{uid}")])
+    buttons.append([InlineKeyboardButton(text="✅ ГОЛОСОВАТЬ",callback_data=f"vote_confirm:{chat_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def private_bot_keyboard(bot_username=None):
+    buttons=[]
+    if bot_username: buttons.append([InlineKeyboardButton(text="➕ ДОБАВИТЬ В ГРУППУ",url=f"https://t.me/{bot_username}?startgroup=mafia")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def postgame_keyboard(): return None
 
 load_dotenv()
 BOT_TOKEN=os.getenv("BOT_TOKEN")
 if not BOT_TOKEN: raise RuntimeError("❌ Не найден BOT_TOKEN. Добавьте BOT_TOKEN в переменные окружения Bothost или в .env локально.")
 
 dp=Dispatcher(); games={}; game_messages={}; game_message_ids={}; game_tasks={}; BOT_USERNAME=None
-welcome_messages={}; welcome_locks={}
-private_pairs={}
+welcome_messages={}; welcome_locks={}; private_pairs={}
 
 async def send_game_message(bot,game,text,**kwargs):
     m=await bot.send_message(game.chat_id,text,**kwargs); game_message_ids.setdefault(game.chat_id,set()).add(m.message_id); return m
@@ -32,73 +55,68 @@ async def delete_message_safe(bot,chat_id,message_id):
 async def send_private_game_message(bot,game,user_id,text,**kwargs):
     m=await bot.send_message(user_id,text,**kwargs); private_pairs.setdefault(game.chat_id,set()).add((user_id,m.message_id)); return m
 async def cleanup_game_messages(bot,chat_id):
-    for mid in set(game_message_ids.pop(chat_id,set())): await delete_message_safe(bot,chat_id,mid)
+    for message_id in set(game_message_ids.pop(chat_id,set())): await delete_message_safe(bot,chat_id,message_id)
     mid=game_messages.pop(chat_id,None)
     if mid: await delete_message_safe(bot,chat_id,mid)
     for uid,mid in set(private_pairs.pop(chat_id,set())): await delete_message_safe(bot,uid,mid)
 async def is_group_admin(bot,chat_id,user_id):
-    try: return (await bot.get_chat_member(chat_id,user_id)).status in (ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.CREATOR)
-    except Exception as e: print(f"⚠️ Ошибка проверки администратора: {e}"); return False
+    try:return (await bot.get_chat_member(chat_id,user_id)).status in (ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.CREATOR)
+    except Exception as e:print(f"⚠️ Ошибка проверки администратора: {e}");return False
 
-def get_player_name(user): return user.full_name or "Игрок"
-def safe_name(game,uid): return html.escape(game.player_names.get(uid,"Игрок"))
+def get_player_name(user):return user.full_name or "Игрок"
+def safe_name(game,uid):return html.escape(game.player_names.get(uid,"Игрок"))
 def get_players_text(game):
     if not game.players:return "Пока никто не присоединился."
     return "\n".join(f"{i}. {'🔴' if game.started and uid not in game.alive else '🟢'} {safe_name(game,uid)}" for i,uid in enumerate(game.players,1))
 def get_lobby_text(game):
-    c=len(game.players); status=f"⏳ Нужно ещё <b>{game.MIN_PLAYERS-c} игрока</b>" if c<game.MIN_PLAYERS else "✅ <b>Минимум игроков набран!</b>"
+    c=len(game.players);status=f"⏳ Нужно ещё <b>{game.MIN_PLAYERS-c} игрока</b>" if c<game.MIN_PLAYERS else "✅ <b>Минимум игроков набран!</b>"
     return f"🎭 <b>MAFIA — {html.escape(game.group_title)}</b>\n\n👥 Игроков: <b>{c}</b>\n\n{get_players_text(game)}\n\n{status}\n\n🔵 Остальные участники группы могут свободно общаться и наблюдать."
-def get_welcome_text(title="MAFIA"): return f"🎭 <b>MAFIA — {html.escape(title)}</b>\n\nГотовы сыграть?\n\n👥 Минимум игроков: <b>4</b>\n🔎 Комиссар появляется с 6 игроков.\n🔒 Секретные действия выполняются приватно."
-def get_game_status_text(game): return f"🎭 <b>MAFIA — {html.escape(game.group_title)}</b>\n\n👥 Игроков: <b>{len(game.players)}</b>\n🟢 Живых: <b>{len(game.alive)}</b>\n\n🌙 Ночь: <b>{game.night_number}</b>\n☀️ День: <b>{game.day_number}</b>\n\n<b>{get_phase_name(game.phase)}</b>"
-def get_phase_name(p): return {"starting":"🎲 Распределение ролей","night":"🌙 Город засыпает","day_discussion":"💬 Обсуждение","day_vote":"🗳 Голосование","last_word":"🔴 Последнее слово","finished":"🏆 Игра завершена","stopped":"⏹ Игра остановлена"}.get(p,p)
+def get_welcome_text(title="MAFIA"):return f"🎭 <b>MAFIA — {html.escape(title)}</b>\n\nГотовы сыграть?\n\n👥 Минимум игроков: <b>4</b>\n🔎 Комиссар появляется с 6 игроков.\n🔒 Секретные действия выполняются приватно."
+def get_game_status_text(game):return f"🎭 <b>MAFIA — {html.escape(game.group_title)}</b>\n\n👥 Игроков: <b>{len(game.players)}</b>\n🟢 Живых: <b>{len(game.alive)}</b>\n\n🌙 Ночь: <b>{game.night_number}</b>\n☀️ День: <b>{game.day_number}</b>\n\n<b>{get_phase_name(game.phase)}</b>"
+def get_phase_name(p):return {"starting":"🎲 Распределение ролей","night":"🌙 Город засыпает","day_discussion":"💬 Обсуждение","day_vote":"🗳 Голосование","last_word":"🔴 Последнее слово","finished":"🏆 Игра завершена","stopped":"⏹ Игра остановлена"}.get(p,p)
 def settings_keyboard():
-    from aiogram.types import InlineKeyboardMarkup,InlineKeyboardButton
     vals=[2,4,6,8,10]
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"💬 {v} мин.",callback_data=f"setting_discussion_{v}") for v in vals[:3]],[InlineKeyboardButton(text=f"💬 {v} мин.",callback_data=f"setting_discussion_{v}") for v in vals[3:]],[InlineKeyboardButton(text="🌙 Ночь −",callback_data="setting_night_minus"),InlineKeyboardButton(text="🌙 Ночь +",callback_data="setting_night_plus")],[InlineKeyboardButton(text="🔴 Последнее слово −",callback_data="setting_lastword_minus"),InlineKeyboardButton(text="🔴 Последнее слово +",callback_data="setting_lastword_plus")],[InlineKeyboardButton(text="⬅️ НАЗАД",callback_data="settings_back")]])
-def get_settings_text(game): return f"⚙️ <b>НАСТРОЙКИ</b>\n\n💬 Обсуждение: <b>{game.discussion_seconds//60} мин.</b>\n🌙 Ночь: <b>{game.night_seconds//60} мин.</b>\n🔴 Последнее слово: <b>{game.last_word_seconds} сек.</b>\n\n💬 Время обсуждения: <b>2 / 4 / 6 / 8 / 10 мин.</b>"
+def get_settings_text(game):return f"⚙️ <b>НАСТРОЙКИ</b>\n\n💬 Обсуждение: <b>{game.discussion_seconds//60} мин.</b>\n🌙 Ночь: <b>{game.night_seconds//60} мин.</b>\n🔴 Последнее слово: <b>{game.last_word_seconds} сек.</b>\n\n💬 Время обсуждения: <b>2 / 4 / 6 / 8 / 10 мин.</b>"
 async def setup_bot_avatar(bot):
     path=os.path.join(os.path.dirname(os.path.abspath(__file__)),"bot_avatar.jpg")
     if not os.path.exists(path):return
-    try: await bot.set_my_profile_photo(photo=InputProfilePhotoStatic(photo=FSInputFile(path)))
-    except Exception as e: print(f"⚠️ Не удалось установить аватар: {e}")
-
-async def ensure_welcome_message(bot,chat_id,title):
-    lock=welcome_locks.setdefault(chat_id,asyncio.Lock())
+    try:await bot.set_my_profile_photo(photo=InputProfilePhotoStatic(photo=FSInputFile(path)))
+    except Exception as e:print(f"⚠️ Не удалось установить аватар: {e}")
+async def ensure_welcome_message(bot,cid,title):
+    lock=welcome_locks.setdefault(cid,asyncio.Lock())
     async with lock:
-        if chat_id in welcome_messages:return welcome_messages[chat_id]
-        m=await bot.send_message(chat_id,get_welcome_text(title or "MAFIA"),reply_markup=admin_start_keyboard(),parse_mode="HTML")
-        welcome_messages[chat_id]=m.message_id; game_message_ids.setdefault(chat_id,set()).add(m.message_id); return m.message_id
+        if cid in welcome_messages:return welcome_messages[cid]
+        m=await bot.send_message(cid,get_welcome_text(title or "MAFIA"),reply_markup=admin_start_keyboard(),parse_mode="HTML");welcome_messages[cid]=m.message_id;game_message_ids.setdefault(cid,set()).add(m.message_id);return m.message_id
 
 @dp.message(CommandStart())
 async def start_handler(message:Message):
-    bot=message.bot; me=await bot.get_me()
-    global BOT_USERNAME; BOT_USERNAME=me.username
+    bot=message.bot;me=await bot.get_me();global BOT_USERNAME;BOT_USERNAME=me.username
     if message.chat.type in (ChatType.GROUP,ChatType.SUPERGROUP):
         game=games.get(message.chat.id)
         if game and (game.started or game.players):return
-        await ensure_welcome_message(bot,message.chat.id,message.chat.title or "MAFIA"); return
-    arg=(message.text or "").split(maxsplit=1)[1] if " " in (message.text or "") else ""; target=None
+        await ensure_welcome_message(bot,message.chat.id,message.chat.title or "MAFIA");return
+    arg=(message.text or "").split(maxsplit=1)[1] if " " in (message.text or "") else "";target=None
     if arg.startswith("game_"):
-        try: target=games.get(int(arg.split("_",1)[1]))
-        except ValueError: pass
+        try:target=games.get(int(arg.split("_",1)[1]))
+        except ValueError:pass
     await message.answer("🎭 <b>MAFIA</b>\n\nЛичный игровой интерфейс открыт.\nСекретные действия и результаты видны только вам.",reply_markup=private_bot_keyboard(me.username),parse_mode="HTML")
-    if target and target.started and message.from_user.id in target.alive and target.phase=="night": await send_current_private_action(bot,target,message.from_user.id)
+    if target and target.started and message.from_user.id in target.alive and target.phase=="night":await send_current_private_action(bot,target,message.from_user.id)
 
 @dp.my_chat_member()
-async def bot_added_to_group(event:ChatMemberUpdated,bot:Bot):
+async def bot_added(event:ChatMemberUpdated,bot:Bot):
     chat=event.chat
     if chat.type not in (ChatType.GROUP,ChatType.SUPERGROUP):return
     if event.new_chat_member.status not in (ChatMemberStatus.MEMBER,ChatMemberStatus.ADMINISTRATOR):return
     if event.old_chat_member.status not in (ChatMemberStatus.LEFT,ChatMemberStatus.KICKED):return
     await ensure_welcome_message(bot,chat.id,chat.title or "MAFIA")
 
-async def create_lobby_for_chat(bot,chat_id,creator_id,title):
-    game=games.get(chat_id)
+async def create_lobby_for_chat(bot,cid,creator,title):
+    game=games.get(cid)
     if game and game.started:return None,"⚠️ Игра уже идёт."
     if game and game.players:return None,"⚠️ Уже есть открытое лобби."
-    await cleanup_game_messages(bot,chat_id); welcome_messages.pop(chat_id,None)
-    game=Game(chat_id=chat_id,creator_id=creator_id,group_title=title or "MAFIA"); games[chat_id]=game
-    m=await bot.send_message(chat_id,get_lobby_text(game),reply_markup=lobby_keyboard(True,False),parse_mode="HTML"); game_messages[chat_id]=m.message_id; game_message_ids.setdefault(chat_id,set()).add(m.message_id); return game,None
+    await cleanup_game_messages(bot,cid);welcome_messages.pop(cid,None);game=Game(chat_id=cid,creator_id=creator,group_title=title or "MAFIA");games[cid]=game
+    m=await bot.send_message(cid,get_lobby_text(game),reply_markup=lobby_keyboard(True,False),parse_mode="HTML");game_messages[cid]=m.message_id;game_message_ids.setdefault(cid,set()).add(m.message_id);return game,None
 
 @dp.message(Command("mafia"))
 async def mafia_command(message:Message,bot:Bot):
@@ -110,36 +128,35 @@ async def mafia_command(message:Message,bot:Bot):
 async def stop_command(message:Message,bot:Bot):
     if message.chat.type not in (ChatType.GROUP,ChatType.SUPERGROUP):return
     if not await is_group_admin(bot,message.chat.id,message.from_user.id):await message.answer("⚠️ Только администратор группы.");return
-    cid=message.chat.id; game=games.get(cid)
+    cid=message.chat.id;game=games.get(cid)
     if game:game.stop()
     task=game_tasks.get(cid)
     if task and not task.done():task.cancel()
-    await cleanup_game_messages(bot,cid); welcome_messages.pop(cid,None); await ensure_welcome_message(bot,cid,message.chat.title or "MAFIA")
+    await cleanup_game_messages(bot,cid);welcome_messages.pop(cid,None);await ensure_welcome_message(bot,cid,message.chat.title or "MAFIA")
 @dp.message(Command("restart"))
 async def restart_command(message:Message,bot:Bot):
     if message.chat.type not in (ChatType.GROUP,ChatType.SUPERGROUP):return
     if not await is_group_admin(bot,message.chat.id,message.from_user.id):await message.answer("⚠️ Только администратор группы.");return
-    cid=message.chat.id; game=games.get(cid)
+    cid=message.chat.id;game=games.get(cid)
     if not game or not game.can_start():await message.answer("❌ Для рестарта нужно минимум 4 игрока.");return
     task=game_tasks.get(cid)
     if task and not task.done():task.cancel()
-    await cleanup_game_messages(bot,cid); game.restart()
-    m=await bot.send_message(cid,f"🔄 <b>ИГРА ПЕРЕЗАПУСКАЕТСЯ</b>\n\n👥 Игроков: <b>{len(game.players)}</b>\n\n🎲 Роли будут распределены заново.",reply_markup=admin_game_keyboard(cid,BOT_USERNAME),parse_mode="HTML"); game_messages[cid]=m.message_id; game_message_ids.setdefault(cid,set()).add(m.message_id); await start_game_task(bot,game)
+    await cleanup_game_messages(bot,cid);game.restart();m=await bot.send_message(cid,f"🔄 <b>ИГРА ПЕРЕЗАПУСКАЕТСЯ</b>\n\n👥 Игроков: <b>{len(game.players)}</b>\n\n🎲 Роли будут распределены заново.",reply_markup=admin_game_keyboard(cid,BOT_USERNAME),parse_mode="HTML");game_messages[cid]=m.message_id;game_message_ids.setdefault(cid,set()).add(m.message_id);await start_game_task(bot,game)
 
 @dp.callback_query(F.data=="create_game")
 async def create_game(callback:CallbackQuery,bot:Bot):
     if not callback.message:return
     if not await is_group_admin(bot,callback.message.chat.id,callback.from_user.id):await callback.answer("⚠️ Только администратор группы.",show_alert=True);return
-    game,err=await create_lobby_for_chat(bot,callback.message.chat.id,callback.from_user.id,callback.message.chat.title or "MAFIA"); await callback.answer(err or "🎭 Игровая комната создана!",show_alert=bool(err))
+    game,err=await create_lobby_for_chat(bot,callback.message.chat.id,callback.from_user.id,callback.message.chat.title or "MAFIA");await callback.answer(err or "🎭 Игровая комната создана!",show_alert=bool(err))
 @dp.callback_query(F.data=="join_game")
 async def join_game(callback:CallbackQuery,bot:Bot):
     if not callback.message:return
-    game=games.get(callback.message.chat.id); uid=callback.from_user.id
+    game=games.get(callback.message.chat.id);uid=callback.from_user.id
     if not game or game.started:await callback.answer("❌ Сейчас нельзя присоединиться.",show_alert=True);return
     if uid in game.players:await callback.answer("🎭 Вы уже участвуете!",show_alert=True);return
-    game.add_player(uid); game.player_names[uid]=get_player_name(callback.from_user)
+    game.add_player(uid);game.player_names[uid]=get_player_name(callback.from_user)
     if callback.from_user.username:game.player_usernames[uid]="@"+callback.from_user.username
-    await callback.message.edit_text(get_lobby_text(game),reply_markup=lobby_keyboard(True,game.can_start()),parse_mode="HTML"); await callback.answer("🎮 Вы присоединились!")
+    await callback.message.edit_text(get_lobby_text(game),reply_markup=lobby_keyboard(True,game.can_start()),parse_mode="HTML");await callback.answer("🎮 Вы присоединились!")
 @dp.callback_query(F.data=="settings")
 async def settings(callback:CallbackQuery,bot:Bot):
     if not callback.message:return
@@ -174,7 +191,7 @@ async def start_game(callback:CallbackQuery,bot:Bot):
     if not await is_group_admin(bot,cid,callback.from_user.id):await callback.answer("⚠️ Только администратор.",show_alert=True);return
     if not game.can_start():await callback.answer("❌ Нужно минимум 4 игрока.",show_alert=True);return
     if game.started:await callback.answer("🌙 Игра уже идёт.",show_alert=True);return
-    game.start(); await callback.message.edit_text(f"🎭 <b>ИГРА НАЧИНАЕТСЯ</b>\n\n👥 Игроков: <b>{len(game.players)}</b>\n\n🔒 Роли и ночные действия не публикуются.",reply_markup=admin_game_keyboard(cid,BOT_USERNAME),parse_mode="HTML");game_messages[cid]=callback.message.message_id;game_message_ids.setdefault(cid,set()).add(callback.message.message_id);await callback.answer("🎭 Игра началась!");await start_game_task(bot,game)
+    game.start();await callback.message.edit_text(f"🎭 <b>ИГРА НАЧИНАЕТСЯ</b>\n\n👥 Игроков: <b>{len(game.players)}</b>\n\n🔒 Роли и ночные действия не публикуются.",reply_markup=admin_game_keyboard(cid,BOT_USERNAME),parse_mode="HTML");game_messages[cid]=callback.message.message_id;game_message_ids.setdefault(cid,set()).add(callback.message.message_id);await callback.answer("🎭 Игра началась!");await start_game_task(bot,game)
 async def start_game_task(bot,game):
     old=game_tasks.get(game.chat_id)
     if old and not old.done():old.cancel()
@@ -245,8 +262,7 @@ async def run_commissioner_phase(bot,game):
         t=[x for x in game.alive if x!=c]
         if t:game.commissioner_target=random.choice(t)
 async def run_night(bot,game):
-    game.night_number+=1;game.phase="night";game.reset_night_actions();await update_main_game_message(bot,game)
-    await send_game_message(bot,game,f"🌙 <b>ГОРОД ЗАСЫПАЕТ — НОЧЬ {game.night_number}</b>\n\n🔒 Все ночные действия выполняются тайно.",parse_mode="HTML");await run_mafia_phase(bot,game)
+    game.night_number+=1;game.phase="night";game.reset_night_actions();await update_main_game_message(bot,game);await send_game_message(bot,game,f"🌙 <b>ГОРОД ЗАСЫПАЕТ — НОЧЬ {game.night_number}</b>\n\n🔒 Все ночные действия выполняются тайно.",parse_mode="HTML");await run_mafia_phase(bot,game)
     if not game.started:return
     await run_doctor_phase(bot,game)
     if not game.started:return
@@ -269,8 +285,7 @@ def resolve_night(game):
     return list(deaths)
 async def run_last_word(bot,game,player_id):
     game.phase="last_word";game.last_word_player=player_id;game.last_word_text=None;game.action_event.clear();await update_main_game_message(bot,game)
-    login=game.player_usernames.get(player_id,safe_name(game,player_id))
-    await send_game_message(bot,game,f"🔴 <b>ПОСЛЕДНЕЕ СЛОВО</b>\n\n☠️ <b>{login}</b> убит.\n\n💬 Оставьте одно последнее сообщение.\n⏱ {game.last_word_seconds} сек.",parse_mode="HTML")
+    login=game.player_usernames.get(player_id,safe_name(game,player_id));await send_game_message(bot,game,f"🔴 <b>ПОСЛЕДНЕЕ СЛОВО</b>\n\n☠️ <b>{login}</b> убит.\n\n💬 Оставьте одно последнее сообщение.\n⏱ {game.last_word_seconds} сек.",parse_mode="HTML")
     try:await asyncio.wait_for(game.action_event.wait(),timeout=game.last_word_seconds)
     except asyncio.TimeoutError:pass
     game.last_word_used.add(player_id);game.last_word_player=None;await update_main_game_message(bot,game)
@@ -278,8 +293,7 @@ async def run_day(bot,game):
     game.day_number+=1;game.phase="day_discussion";await update_main_game_message(bot,game);await send_game_message(bot,game,f"☀️ <b>ДЕНЬ</b>\n\n💬 <b>ОБСУЖДЕНИЕ</b>\n\nОбсуждение длится <b>{game.discussion_seconds//60} мин.</b>",parse_mode="HTML");await asyncio.sleep(game.discussion_seconds)
     if game.started:await conduct_vote(bot,game,None)
 async def vote_status_text(game,candidates):
-    lines=["🗳 <b>ГОЛОСОВАНИЕ</b>","","👥 Кто за кого проголосовал:"]
-    lines += [f"👤 {safe_name(game,v)} → 🎯 {safe_name(game,t)}" for v,t in game.day_votes.items()] or ["Пока никто не подтвердил голос."]
+    lines=["🗳 <b>ГОЛОСОВАНИЕ</b>","","👥 Кто за кого проголосовал:"]+[f"👤 {safe_name(game,v)} → 🎯 {safe_name(game,t)}" for v,t in game.day_votes.items()] or ["Пока никто не подтвердил голос."]
     lines += ["",f"⏳ Не проголосовали: <b>{len([u for u in game.alive_players() if u not in game.day_votes])}</b>"]
     return "\n".join(lines)
 async def conduct_vote(bot,game,candidates):
@@ -304,8 +318,7 @@ async def conduct_vote(bot,game,candidates):
     if eliminated in game.alive:game.alive.remove(eliminated)
     await send_game_message(bot,game,f"🔴 <b>{safe_name(game,eliminated)}</b> покидает игру.",parse_mode="HTML");await run_last_word(bot,game,eliminated)
 async def publish_vote_results(bot,game):
-    lines=["🗳 <b>РЕЗУЛЬТАТЫ ГОЛОСОВАНИЯ</b>","","👥 Кто за кого:"]+[f"👤 {safe_name(game,v)} → 🎯 {safe_name(game,t)}" for v,t in game.day_votes.items()]+["","📊 <b>ИТОГ:</b>"]+[f"{safe_name(game,u)} — <b>{c}</b> голос(а)" for u,c in Counter(game.day_votes.values()).most_common()]
-    await send_game_message(bot,game,"\n".join(lines),parse_mode="HTML")
+    lines=["🗳 <b>РЕЗУЛЬТАТЫ ГОЛОСОВАНИЯ</b>","","👥 Кто за кого:"]+[f"👤 {safe_name(game,v)} → 🎯 {safe_name(game,t)}" for v,t in game.day_votes.items()]+["","📊 <b>ИТОГ:</b>"]+[f"{safe_name(game,u)} — <b>{c}</b> голос(а)" for u,c in Counter(game.day_votes.values()).most_common()];await send_game_message(bot,game,"\n".join(lines),parse_mode="HTML")
 @dp.callback_query(F.data.startswith("vote_select:"))
 async def vote_select(callback:CallbackQuery):
     try:_,cs,ts=callback.data.split(":");cid=int(cs);target=int(ts)
@@ -407,7 +420,7 @@ async def admin_restart_unused(callback:CallbackQuery):await callback.answer("И
 @dp.callback_query(F.data=="admin_new_game")
 async def admin_new_unused(callback:CallbackQuery):await callback.answer("Используйте /mafia.",show_alert=True)
 @dp.callback_query(F.data.startswith("my_night:"))
-async def my_night(callback:CallbackQuery):await callback.answer("🔐 Откройте личный чат с ботом через «🎭 МОЙ НОЧНОЙ ХОД». ",show_alert=True)
+async def my_night(callback:CallbackQuery):await callback.answer("🔐 Откройте личный чат с ботом через «🎭 МОЙ НОЧНОЙ ХОД».",show_alert=True)
 @dp.message()
 async def group_messages(message:Message,bot:Bot):
     if message.chat.type==ChatType.PRIVATE:return
@@ -418,8 +431,7 @@ async def group_messages(message:Message,bot:Bot):
     if game.started and game.phase=="last_word" and uid==game.last_word_player and message.text:
         text=html.escape(message.text.strip())
         if not text:return
-        game.last_word_text=text;await delete_message_safe(bot,message.chat.id,message.message_id)
-        login=game.player_usernames.get(uid,safe_name(game,uid))
+        game.last_word_text=text;await delete_message_safe(bot,message.chat.id,message.message_id);login=game.player_usernames.get(uid,safe_name(game,uid))
         await send_game_message(bot,game,f"🔴 <b>ПОСЛЕДНЕЕ СЛОВО</b>\n\n☠️ <b>{login} убит.</b>\n\n💬 <b>Последнее сообщение:</b>\n<blockquote>«{text}»</blockquote>",parse_mode="HTML");game.action_event.set();return
     if game.started and uid in game.players and uid not in game.alive:await delete_message_safe(bot,message.chat.id,message.message_id)
 async def finish_game(bot,game,winner):
@@ -427,8 +439,7 @@ async def finish_game(bot,game,winner):
 async def main():
     global BOT_USERNAME
     bot=Bot(token=BOT_TOKEN);me=await bot.get_me();BOT_USERNAME=me.username;print("🟢 Mafia Bot запускается...");await setup_bot_avatar(bot)
-    await bot.set_my_commands([BotCommand(command="mafia",description="Начать новую Мафию"),BotCommand(command="stop",description="Остановить игру"),BotCommand(command="restart",description="Перезапустить игру")],scope=BotCommandScopeAllGroupChats())
-    print("🟢 Команды /mafia /stop /restart зарегистрированы");print("🟢 Mafia Bot запущен")
+    await bot.set_my_commands([BotCommand(command="mafia",description="Начать новую Мафию"),BotCommand(command="stop",description="Остановить игру"),BotCommand(command="restart",description="Перезапустить игру")],scope=BotCommandScopeAllGroupChats());print("🟢 Команды /mafia /stop /restart зарегистрированы");print("🟢 Mafia Bot запущен")
     try:await dp.start_polling(bot)
     finally:await bot.session.close()
 if __name__=="__main__":asyncio.run(main())
