@@ -31,6 +31,7 @@ game_message_ids: dict[int, set[int]] = {}
 private_message_ids: dict[int, set[int]] = {}
 game_tasks: dict[int, asyncio.Task] = {}
 BOT_USERNAME: str | None = None
+private_alerts: dict[tuple[int, str], str] = {}
 
 
 async def send_game_message(bot: Bot, game: Game, text: str, **kwargs):
@@ -163,10 +164,6 @@ def settings_keyboard():
     rows.append([InlineKeyboardButton(text=f"💬 {v} мин.", callback_data=f"setting_discussion_{v}") for v in values[:3]])
     rows.append([InlineKeyboardButton(text=f"💬 {v} мин.", callback_data=f"setting_discussion_{v}") for v in values[3:]])
     rows.append([
-        InlineKeyboardButton(text="🌙 Ночь −", callback_data="setting_night_minus"),
-        InlineKeyboardButton(text="🌙 Ночь +", callback_data="setting_night_plus"),
-    ])
-    rows.append([
         InlineKeyboardButton(text="🔴 Последнее слово −", callback_data="setting_lastword_minus"),
         InlineKeyboardButton(text="🔴 Последнее слово +", callback_data="setting_lastword_plus"),
     ])
@@ -178,7 +175,7 @@ def get_settings_text(game: Game) -> str:
     return (
         "⚙️ <b>НАСТРОЙКИ</b>\n\n"
         f"💬 Обсуждение: <b>{game.discussion_seconds // 60} мин.</b>\n"
-        f"🌙 Ночь: <b>{game.night_seconds // 60} мин.</b>\n"
+        f"🌙 Ночь: <b>15 сек.</b>\n"
         f"🔴 Последнее слово: <b>{game.last_word_seconds} сек.</b>\n\n"
         "💬 Время обсуждения можно выбрать: <b>2 / 4 / 6 / 8 / 10 мин.</b>"
     )
@@ -377,26 +374,9 @@ async def start_handler(message: Message):
     if target_game and target_game.started and message.from_user.id in target_game.alive and target_game.phase == "night":
         await send_current_private_action(bot, target_game, message.from_user.id)
         return
-    await message.answer(
-        "🎭 <b>MAFIA</b>\n\n"
-        "Личный игровой режим активирован.\n"
-        "Секретные действия и результаты видны только вам.",
-        parse_mode="HTML",
-    )
-
-
-@dp.callback_query(F.data == "private_launch")
-async def private_launch_handler(callback: CallbackQuery, bot: Bot):
-    me = await bot.get_me()
-    await callback.message.edit_text(
-        "🎭 <b>MAFIA</b>\n\nОткройте игру из кнопки «🎭 МОЙ НОЧНОЙ ХОД» в группе.",
-        reply_markup=private_bot_keyboard(me.username), parse_mode="HTML")
-    await callback.answer("▶️ Готово.")
-
-
-@dp.callback_query(F.data == "private_restart")
-async def private_restart_handler(callback: CallbackQuery, bot: Bot):
-    await callback.answer("🔄 Рестарт выполняется администратором в группе.", show_alert=True)
+    # Обычный /start не открывает служебное окно между ходами.
+    # Ночной интерфейс открывается только через deep-link game_<chat_id>.
+    return
 
 
 @dp.my_chat_member()
@@ -527,10 +507,9 @@ async def setting_change_handler(callback: CallbackQuery, bot: Bot):
     if data.startswith("setting_discussion_"):
         try: game.discussion_seconds = int(data.rsplit("_", 1)[1]) * 60
         except ValueError: pass
-    elif data == "setting_night_minus": game.night_seconds = max(60, game.night_seconds - 60)
-    elif data == "setting_night_plus": game.night_seconds = min(300, game.night_seconds + 60)
-    elif data == "setting_lastword_minus": game.last_word_seconds = max(10, game.last_word_seconds - 10)
-    elif data == "setting_lastword_plus": game.last_word_seconds = min(60, game.last_word_seconds + 10)
+    elif data in ("setting_lastword_minus", "setting_lastword_plus"):
+        game.last_word_seconds = 15
+    game.night_seconds = 15
     await callback.message.edit_text(get_settings_text(game), reply_markup=settings_keyboard(), parse_mode="HTML")
     await callback.answer("⚙️ Настройка изменена.")
 
@@ -621,123 +600,184 @@ async def private_target_message(bot: Bot, game: Game, user_id: int, title: str,
 
 
 async def send_current_private_action(bot: Bot, game: Game, user_id: int):
+    """Open the private action UI for the player's current night role."""
     role = game.roles.get(user_id)
     if role == MAFIA:
-        targets = [(uid, game.player_names.get(uid, "Игрок")) for uid in game.alive if game.roles.get(uid) != MAFIA]
-        await send_private_game_message(bot, game, user_id, "🔫 <b>ХОД МАФИИ</b>\n\nКого устранить?", reply_markup=target_keyboard(game.chat_id, targets, "mafia_target", game.mafia_votes.get(user_id)), parse_mode="HTML")
-    elif role == DOCTOR:
-        targets = [(uid, game.player_names.get(uid, "Игрок")) for uid in game.doctor_targets()]
-        if targets:
-            await send_private_game_message(bot, game, user_id, "💊 <b>ХОД ДОКТОРА</b>\n\nКого спасти?", reply_markup=target_keyboard(game.chat_id, targets, "doctor_target", game.doctor_target), parse_mode="HTML")
-    elif role == COMMISSIONER:
-        await send_private_game_message(bot, game, user_id, "🔎 <b>ХОД КОМИССАРА</b>\n\nВыберите действие.", reply_markup=night_action_keyboard(game.chat_id, role), parse_mode="HTML")
-
-
-async def run_mafia_phase(bot: Bot, game: Game):
-    mafia = game.alive_mafia()
-    if not mafia: return
-    for uid in mafia:
-        targets = [(tid, game.player_names.get(tid, "Игрок")) for tid in game.alive if game.roles.get(tid) != MAFIA]
-        try:
-            await send_private_game_message(bot, game, uid, "🔫 <b>ХОД МАФИИ</b>\n\nКого устранить?", reply_markup=target_keyboard(game.chat_id, targets, "mafia_target", game.mafia_votes.get(uid)), parse_mode="HTML")
-        except Exception:
-            pass
-    game.action_event.clear()
-    try: await asyncio.wait_for(game.action_event.wait(), timeout=game.night_seconds)
-    except asyncio.TimeoutError: pass
-    for uid in mafia:
-        if uid not in game.mafia_votes:
-            targets = [tid for tid in game.alive if game.roles.get(tid) != MAFIA]
-            if targets: game.mafia_votes[uid] = random.choice(targets)
-
-
-async def run_doctor_phase(bot: Bot, game: Game):
-    doctor = next((uid for uid in game.alive if game.roles.get(uid) == DOCTOR), None)
-    if doctor is None: return
-    targets = game.doctor_targets()
-    if not targets: return
-    try:
-        await send_private_game_message(bot, game, doctor, "💊 <b>ХОД ДОКТОРА</b>\n\nКого спасти?", reply_markup=target_keyboard(game.chat_id, [(uid, game.player_names.get(uid, "Игрок")) for uid in targets], "doctor_target", game.doctor_target), parse_mode="HTML")
-    except Exception: pass
-    game.action_event.clear()
-    try: await asyncio.wait_for(game.action_event.wait(), timeout=game.night_seconds)
-    except asyncio.TimeoutError: pass
-    if game.doctor_target is None:
-        game.doctor_target = random.choice(targets)
-
-
-async def run_commissioner_phase(bot: Bot, game: Game):
-    commissioner = next((uid for uid in game.alive if game.roles.get(uid) == COMMISSIONER), None)
-    if commissioner is None: return
-    try:
+        targets = [(uid, game.player_names.get(uid, "Игрок"))
+                   for uid in game.alive if game.roles.get(uid) != MAFIA]
         await send_private_game_message(
-            bot, game, commissioner,
-            "🔎 <b>ХОД КОМИССАРА</b>\n\nВыберите только одно действие: <b>проверить</b> или <b>убить</b>.",
-            reply_markup=night_action_keyboard(game.chat_id, COMMISSIONER), parse_mode="HTML")
-    except Exception: pass
-    game.action_event.clear()
-    try: await asyncio.wait_for(game.action_event.wait(), timeout=game.night_seconds)
-    except asyncio.TimeoutError: pass
-    if game.commissioner_target is None and game.commissioner_kill_target is None:
+            bot, game, user_id,
+            "🔫 <b>ХОД МАФИИ</b>\n\nВыберите игрока, которого хотите убить.",
+            reply_markup=target_keyboard(game.chat_id, targets, "mafia_target", game.mafia_votes.get(user_id)),
+            parse_mode="HTML")
+    elif role == DOCTOR:
+        targets = [(uid, game.player_names.get(uid, "Игрок"))
+                   for uid in game.doctor_targets()]
+        if targets:
+            await send_private_game_message(
+                bot, game, user_id,
+                "💊 <b>ХОД ДОКТОРА</b>\n\nВыберите игрока, которого хотите лечить.",
+                reply_markup=target_keyboard(game.chat_id, targets, "doctor_target", game.doctor_target),
+                parse_mode="HTML")
+    elif role == COMMISSIONER:
+        await send_private_game_message(
+            bot, game, user_id,
+            "🔎 <b>ХОД КОМИССАРА</b>\n\nВыберите одно действие.",
+            reply_markup=night_action_keyboard(game.chat_id, role),
+            parse_mode="HTML")
+
+
+async def _open_night_actions(bot: Bot, game: Game):
+    """Send all human night actions at once; bots are resolved by the same deadline."""
+    tasks = []
+    for uid in list(game.alive):
+        if is_bot_user(uid):
+            continue
+        role = game.roles.get(uid)
+        if role in (MAFIA, DOCTOR, COMMISSIONER):
+            tasks.append(send_current_private_action(bot, game, uid))
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _resolve_bot_night_actions(game: Game):
+    """Give bot roles an immediate/automatic choice within the shared 15-second night."""
+    for uid in game.alive_mafia():
+        if uid in game.mafia_votes:
+            continue
+        targets = [tid for tid in game.alive if game.roles.get(tid) != MAFIA]
+        if targets:
+            game.mafia_votes[uid] = random.choice(targets)
+
+    doctor = next((uid for uid in game.alive if game.roles.get(uid) == DOCTOR), None)
+    if doctor is not None and is_bot_user(doctor) and game.doctor_target is None:
+        targets = game.doctor_targets()
+        if targets:
+            game.doctor_target = random.choice(targets)
+
+    commissioner = next((uid for uid in game.alive if game.roles.get(uid) == COMMISSIONER), None)
+    if commissioner is not None and is_bot_user(commissioner) and game.commissioner_target is None and game.commissioner_kill_target is None:
         targets = [uid for uid in game.alive if uid != commissioner]
         if targets:
-            # Если комиссар ничего не выбрал до таймера, автоматически выполняем одно действие.
             if random.choice((True, False)):
                 game.commissioner_target = random.choice(targets)
             else:
                 game.commissioner_kill_target = random.choice(targets)
 
 
+async def run_night_phase_timer(bot: Bot, game: Game, message, seconds: int):
+    deadline = time.monotonic() + max(0, seconds)
+    while game.started:
+        remaining = max(0, int(deadline - time.monotonic() + 0.999))
+        text = f"🌙 <b>ГОРОД ЗАСЫПАЕТ</b>\n\n⏱ <b>{remaining:02d} сек.</b>"
+        try:
+            await bot.edit_message_text(
+                chat_id=game.chat_id, message_id=message.message_id,
+                text=text, reply_markup=bot_chat_keyboard(), parse_mode="HTML")
+        except Exception:
+            pass
+        if remaining <= 0:
+            break
+        await asyncio.sleep(1)
+
+
 async def run_night(bot: Bot, game: Game):
-    game.night_number += 1; game.phase = "night"; game.reset_night_actions()
+    game.night_number += 1
+    game.phase = "night"
+    game.reset_night_actions()
     await update_main_game_message(bot, game)
-    await send_game_message(bot, game, "🌙 <b>ГОРОД ЗАСЫПАЕТ</b>\n\nВсе ночные действия выполняются тайно.", parse_mode="HTML")
-    await run_mafia_phase(bot, game)
-    if not game.started: return
-    await run_doctor_phase(bot, game)
-    if not game.started: return
-    await run_commissioner_phase(bot, game)
-    if not game.started: return
+
+    # Все роли получают свои действия одновременно. Ночь длится ровно один общий лимит — 15 секунд.
+    night_message = await send_game_message(
+        bot, game, "🌙 <b>ГОРОД ЗАСЫПАЕТ</b>\n\n⏱ <b>15 сек.</b>",
+        reply_markup=bot_chat_keyboard(), parse_mode="HTML")
+
+    await _open_night_actions(bot, game)
+    deadline = time.monotonic() + 15
+    timer_task = asyncio.create_task(run_night_phase_timer(bot, game, night_message, 15))
+    try:
+        while game.started:
+            if game.night_actions_complete():
+                break
+            remaining = max(0, deadline - time.monotonic())
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(0.2, remaining))
+    finally:
+        if not timer_task.done():
+            timer_task.cancel()
+            try:
+                await timer_task
+            except asyncio.CancelledError:
+                pass
+
+    # Всё, что не выбрано людьми к дедлайну, выбирается автоматически, чтобы цикл никогда не зависал.
+    await _resolve_bot_night_actions(game)
+    if game.started:
+        for uid in game.alive_mafia():
+            if uid not in game.mafia_votes:
+                targets = [tid for tid in game.alive if game.roles.get(tid) != MAFIA]
+                if targets:
+                    game.mafia_votes[uid] = random.choice(targets)
+        doctor = next((uid for uid in game.alive if game.roles.get(uid) == DOCTOR), None)
+        if doctor is not None and game.doctor_target is None:
+            targets = game.doctor_targets()
+            if targets:
+                game.doctor_target = random.choice(targets)
+        commissioner = next((uid for uid in game.alive if game.roles.get(uid) == COMMISSIONER), None)
+        if commissioner is not None and game.commissioner_target is None and game.commissioner_kill_target is None:
+            targets = [uid for uid in game.alive if uid != commissioner]
+            if targets:
+                game.commissioner_kill_target = random.choice(targets)
+
     deaths = resolve_night(game)
 
-    # Причина убийства в группе, подробности — только в личном чате.
     if game.mafia_kill_target is not None and game.mafia_kill_target in deaths:
         await send_game_message(bot, game, f"🔴 <b>{safe_name(game, game.mafia_kill_target)}</b> убит(а) мафией.", parse_mode="HTML")
     if game.commissioner_kill_target is not None and game.commissioner_kill_target in deaths:
         await send_game_message(bot, game, f"🔴 <b>{safe_name(game, game.commissioner_kill_target)}</b> убит(а) комиссаром.", parse_mode="HTML")
 
-    # Секретные уведомления участникам: причина смерти и факт лечения.
+    # Личные результаты остаются в чате бота. Для автоматического сообщения Telegram
+    # не предоставляет API callback-alert: всплывающее окно возможно только после нажатия кнопки.
     if game.doctor_target is not None:
         try:
-            await send_private_game_message(
-                bot, game, game.doctor_target,
-                "💊 <b>ВАС ВЫЛЕЧИЛИ</b>\n\nЭтой ночью доктор выбрал вас для лечения.",
-                parse_mode="HTML")
-        except Exception: pass
-
+            private_alerts[(game.doctor_target, "healed")] = "💊 ВАС ВЫЛЕЧИЛИ\n\nЭтой ночью доктор выбрал вас для лечения."
+            await send_private_game_message(bot, game, game.doctor_target,
+                "💊 <b>ВАС ВЫЛЕЧИЛИ</b>", reply_markup=private_alert_keyboard("healed"), parse_mode="HTML")
+        except Exception:
+            pass
     if game.mafia_kill_target is not None and game.mafia_kill_target in deaths:
         try:
-            await send_private_game_message(
-                bot, game, game.mafia_kill_target,
-                "🔫 <b>ВАС УБИЛА МАФИЯ</b>\n\nЭтой ночью мафия выбрала вас своей жертвой.",
-                parse_mode="HTML")
-        except Exception: pass
-
+            private_alerts[(game.mafia_kill_target, "mafia_kill")] = "🔫 ВАС УБИЛА МАФИЯ\n\nЭтой ночью мафия выбрала вас своей жертвой."
+            await send_private_game_message(bot, game, game.mafia_kill_target,
+                "🔫 <b>ВАС УБИЛА МАФИЯ</b>", reply_markup=private_alert_keyboard("mafia_kill"), parse_mode="HTML")
+        except Exception:
+            pass
     if game.commissioner_kill_target is not None and game.commissioner_kill_target in deaths:
         try:
-            await send_private_game_message(
-                bot, game, game.commissioner_kill_target,
-                "☠️ <b>ВАС УБИЛ КОМИССАР</b>\n\nЭтой ночью комиссар выбрал вас своей целью.",
-                parse_mode="HTML")
-        except Exception: pass
+            private_alerts[(game.commissioner_kill_target, "commissioner_kill")] = "☠️ ВАС УБИЛ КОМИССАР\n\nЭтой ночью комиссар выбрал вас своей целью."
+            await send_private_game_message(bot, game, game.commissioner_kill_target,
+                "☠️ <b>ВАС УБИЛ КОМИССАР</b>", reply_markup=private_alert_keyboard("commissioner_kill"), parse_mode="HTML")
+        except Exception:
+            pass
 
     if not deaths:
-        await send_game_message(bot, game, "☀️ <b>ГОРОД ПРОСЫПАЕТСЯ</b>\n\nЭтой ночью никто не погиб.", parse_mode="HTML")
-    else:
-        await send_game_message(bot, game, "☀️ <b>ГОРОД ПРОСЫПАЕТСЯ</b>\n\nНочью погибли: " + ", ".join(safe_name(game, uid) for uid in deaths), parse_mode="HTML")
-        for killed in deaths:
-            await send_game_message(bot, game, f"🔴 <b>{safe_name(game, killed)}</b> получает последнее слово.", parse_mode="HTML")
-            await run_last_word(bot, game, killed)
+        await send_game_message(bot, game, "☀️ <b>ГОРОД ПРОСЫПАЕТСЯ</b>\n\nЭтой ночью никто не погиб.",
+                                reply_markup=bot_chat_keyboard(), parse_mode="HTML")
+        return
+
+    await send_game_message(
+        bot, game,
+        "☀️ <b>ГОРОД ПРОСЫПАЕТСЯ</b>\n\nНочью погибли: " + ", ".join(safe_name(game, uid) for uid in deaths),
+        reply_markup=bot_chat_keyboard(), parse_mode="HTML")
+
+    # Последнее слово — максимум 15 секунд. После него цикл всегда продолжается.
+    for killed in list(deaths):
+        if not game.started:
+            return
+        await send_game_message(bot, game, f"🔴 <b>{safe_name(game, killed)}</b> получает последнее слово.",
+                                reply_markup=bot_chat_keyboard(), parse_mode="HTML")
+        await run_last_word(bot, game, killed)
 
 
 def resolve_night(game: Game) -> list[int]:
@@ -762,18 +802,36 @@ def resolve_night(game: Game) -> list[int]:
 
 
 async def run_last_word(bot: Bot, game: Game, player_id: int):
-    game.phase = "last_word"; game.last_word_player = player_id; game.last_word_text = None; game.action_event.clear()
+    game.phase = "last_word"
+    game.last_word_player = player_id
+    game.last_word_text = None
+    game.action_event.clear()
     await update_main_game_message(bot, game)
-    await send_game_message(bot, game, f"🔴 <b>ПОСЛЕДНЕЕ СЛОВО</b>\n\n<b>{safe_name(game, player_id)}</b> может написать последнее слово.\n\n⏱ {game.last_word_seconds} сек.", parse_mode="HTML")
+    message = await send_game_message(
+        bot, game,
+        f"🔴 <b>ПОСЛЕДНЕЕ СЛОВО</b>\n\n<b>{safe_name(game, player_id)}</b> может написать последнее слово.\n\n⏱ <b>15 сек.</b>",
+        reply_markup=bot_chat_keyboard(), parse_mode="HTML")
+    deadline = time.monotonic() + 15
     try:
-        await asyncio.wait_for(game.action_event.wait(), timeout=game.last_word_seconds)
-    except asyncio.TimeoutError:
-        pass
-    except Exception as error:
-        print(f"⚠️ Ошибка последнего слова {game.chat_id}: {error}")
+        while game.started and game.last_word_player == player_id:
+            if game.action_event.is_set():
+                break
+            remaining = max(0, int(deadline - time.monotonic() + 0.999))
+            try:
+                await bot.edit_message_text(
+                    chat_id=game.chat_id, message_id=message.message_id,
+                    text=f"🔴 <b>ПОСЛЕДНЕЕ СЛОВО</b>\n\n<b>{safe_name(game, player_id)}</b> может написать последнее слово.\n\n⏱ <b>{remaining:02d} сек.</b>",
+                    reply_markup=bot_chat_keyboard(), parse_mode="HTML")
+            except Exception:
+                pass
+            if remaining <= 0:
+                break
+            await asyncio.sleep(1)
     finally:
         game.last_word_used.add(player_id)
         game.last_word_player = None
+        game.action_event.clear()
+
 
 
 async def run_countdown_message(bot: Bot, game: Game, message, title: str, seconds: int, footer: str = ""):
@@ -894,6 +952,25 @@ async def conduct_vote(bot: Bot, game: Game, candidates: list[int] | None):
     await run_last_word(bot, game, eliminated)
 
 
+def private_alert_keyboard(kind: str):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔔 ПОКАЗАТЬ УВЕДОМЛЕНИЕ", callback_data=f"private_alert:{kind}")
+    ]])
+
+
+@dp.callback_query(F.data.startswith("private_alert:"))
+async def private_alert_handler(callback: CallbackQuery):
+    if callback.message is None or callback.message.chat.type != ChatType.PRIVATE:
+        await callback.answer("Уведомление доступно в личном чате.", show_alert=True)
+        return
+    kind = callback.data.split(":", 1)[1]
+    text = private_alerts.get((callback.from_user.id, kind))
+    if not text:
+        await callback.answer("Уведомление больше недоступно.", show_alert=True)
+        return
+    await callback.answer(text, show_alert=True)
+
+
 def bot_chat_keyboard():
     if not BOT_USERNAME:
         return None
@@ -940,7 +1017,7 @@ async def handle_private_target(callback: CallbackQuery, role: str):
     name = safe_name(game, target_id)
     if callback.message:
         await callback.message.delete()
-    await callback.message.answer(("🔫 <b>ВЫ УБИЛИ</b>\n\n" if role == MAFIA else "💊 <b>ВЫ ВЫЛЕЧИЛИ</b>\n\n") + name, parse_mode="HTML")
+    await callback.answer(("🔫 ВЫ ВЫБРАЛИ ЖЕРТВУ: " if role == MAFIA else "💊 ВЫ ВЫБРАЛИ ДЛЯ ЛЕЧЕНИЯ: ") + name, show_alert=True)
     if role == MAFIA:
         if len(game.mafia_votes) >= len(game.alive_mafia()): game.action_event.set()
     else: game.action_event.set()
@@ -988,9 +1065,8 @@ async def commissioner_target_handler(callback: CallbackQuery, bot: Bot):
     game.commissioner_target=target_id
     result={MAFIA:"🔴 МАФИЯ", DOCTOR:"💊 ДОКТОР", COMMISSIONER:"🔎 КОМИССАР"}.get(game.roles.get(target_id),"🟢 МИРНЫЙ ЖИТЕЛЬ")
     if callback.message: await callback.message.delete()
-    await send_private_game_message(bot, game, uid, f"🔎 <b>ВЫ ПРОВЕРИЛИ {safe_name(game,target_id)}</b>\n\nРезультат: <b>{result}</b>", parse_mode="HTML")
     game.action_event.set()
-    await callback.answer("🔎 Проверка завершена. Ночь для вас закончена.", show_alert=True)
+    await callback.answer(f"🔎 ВЫ ПРОВЕРИЛИ: {safe_name(game,target_id)}\n\nРезультат: {result}", show_alert=True)
 
 
 
@@ -1005,9 +1081,8 @@ async def commissioner_kill_handler(callback: CallbackQuery, bot: Bot):
         await callback.answer("❌ Вы уже выбрали проверку. Комиссар может сделать только одно действие за ночь.", show_alert=True); return
     game.commissioner_kill_target=target_id
     if callback.message: await callback.message.delete()
-    await send_private_game_message(bot, game, uid, f"☠️ <b>ВЫ УБИЛИ</b>\n\n{safe_name(game,target_id)}", parse_mode="HTML")
     game.action_event.set()
-    await callback.answer("☠️ Убийство принято. Ночь для вас закончена.", show_alert=True)
+    await callback.answer(f"☠️ ВЫ ВЫБРАЛИ ДЛЯ УБИЙСТВА: {safe_name(game,target_id)}", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("cancel_action:"))
@@ -1163,7 +1238,7 @@ async def my_night_handler(callback: CallbackQuery, bot: Bot):
     except Exception: await callback.answer("❌ Некорректная игра.",show_alert=True); return
     game=games.get(chat_id)
     if not game or not game.started or game.phase!="night": await callback.answer("🌅 Сейчас нет ночного хода.",show_alert=True); return
-    await callback.answer("🔐 Откройте личный чат с ботом через кнопку «МОЙ НОЧНОЙ ХОД». ",show_alert=True)
+    await callback.answer("🔐 Откройте личный чат с ботом через кнопку из игрового сообщения.",show_alert=True)
 
 
 async def update_main_game_message(bot: Bot, game: Game):
