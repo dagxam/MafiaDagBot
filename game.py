@@ -48,12 +48,13 @@ class Game:
     mafia_kill_target: int | None = None
     vote_message_id: int | None = None
     day_votes: dict[int, int] = field(default_factory=dict)
+    day_vote_selection: dict[int, int] = field(default_factory=dict)
     tie_candidates: list[int] = field(default_factory=list)
     action_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     discussion_seconds: int = 120
     night_seconds: int = 120
     last_word_seconds: int = 30
-    vote_seconds: int = 120
+    vote_seconds: int = 10
     bot_count: int = 0
     bot_difficulty: str = "medium"
     MIN_PLAYERS = 4
@@ -96,6 +97,7 @@ class Game:
         self.mafia_kill_target = None
         self.vote_message_id = None
         self.day_votes.clear()
+        self.day_vote_selection.clear()
         self.tie_candidates.clear()
         self.action_event.clear()
         self.night_number = 0
@@ -120,6 +122,7 @@ class Game:
         self.mafia_kill_target = None
         self.vote_message_id = None
         self.day_votes.clear()
+        self.day_vote_selection.clear()
         self.tie_candidates.clear()
         self.action_event.set()
         self.night_number = 0
@@ -160,6 +163,7 @@ class Game:
 
     def reset_day_votes(self):
         self.day_votes.clear()
+        self.day_vote_selection.clear()
         self.action_event.clear()
 
     def role_distribution(self):
