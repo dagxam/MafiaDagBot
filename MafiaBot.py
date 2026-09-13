@@ -198,6 +198,49 @@ async def setup_bot_avatar(bot: Bot):
 # COMMANDS: GROUP / PRIVATE
 # =========================
 
+
+def bot_id(chat_id: int, index: int) -> int:
+    return -10_000_000_000 - (abs(chat_id) * 100 + index)
+
+
+def sync_bots(game: Game, count: int):
+    humans = [uid for uid in game.players if uid > 0]
+    count = max(0, min(int(count), 12 - len(humans)))
+    current = [uid for uid in game.players if uid < 0]
+    for uid in current:
+        game.players.remove(uid)
+        game.player_names.pop(uid, None)
+    names = ["Алексей", "Макс", "Виктор", "Данияр", "Илья", "Руслан", "Сергей", "Тимур", "Артур"]
+    for index in range(1, count + 1):
+        uid = bot_id(game.chat_id, index)
+        game.players.append(uid)
+        game.player_names[uid] = f"{random.choice(names)} 🤖"
+    game.bot_count = count
+
+
+def bots_text(game: Game) -> str:
+    labels = {"easy": "🟢 Легко", "medium": "🟡 Средне", "hard": "🔴 Сложно"}
+    return (
+        "🤖 <b>БОТЫ</b>\n\n"
+        f"Количество: <b>{getattr(game, 'bot_count', 0)}</b>\n"
+        f"Сложность: <b>{labels.get(getattr(game, 'bot_difficulty', 'medium'), '🟡 Средне')}</b>"
+    )
+
+
+def bots_keyboard(chat_id: int):
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🤖 1", callback_data=f"bot_count:{chat_id}:1"),
+         InlineKeyboardButton(text="🤖 3", callback_data=f"bot_count:{chat_id}:3"),
+         InlineKeyboardButton(text="🤖 6", callback_data=f"bot_count:{chat_id}:6"),
+         InlineKeyboardButton(text="🤖 9", callback_data=f"bot_count:{chat_id}:9")],
+        [InlineKeyboardButton(text="🟢 ЛЕГКО", callback_data=f"bot_diff:{chat_id}:easy"),
+         InlineKeyboardButton(text="🟡 СРЕДНЕ", callback_data=f"bot_diff:{chat_id}:medium"),
+         InlineKeyboardButton(text="🔴 СЛОЖНО", callback_data=f"bot_diff:{chat_id}:hard")],
+        [InlineKeyboardButton(text="❌ ОТКЛЮЧИТЬ БОТОВ", callback_data=f"bots_off:{chat_id}")],
+        [InlineKeyboardButton(text="⬅️ НАЗАД", callback_data=f"bots_back:{chat_id}")],
+    ])
+
 async def create_lobby_for_group(bot: Bot, message: Message):
     chat_id = message.chat.id
     uid = message.from_user.id
@@ -215,6 +258,7 @@ async def create_lobby_for_group(bot: Bot, message: Message):
         return False
     await cleanup_game_messages(bot, chat_id)
     game = Game(chat_id=chat_id, creator_id=uid, group_title=message.chat.title or "MAFIA")
+    sync_bots(game, 0)
     games[chat_id] = game
     lobby = await bot.send_message(chat_id, get_lobby_text(game), reply_markup=lobby_keyboard(True, False), parse_mode="HTML")
     game_messages[chat_id] = lobby.message_id
@@ -293,7 +337,7 @@ async def bots_command(message: Message, bot: Bot):
     count = getattr(game, "bot_count", 0) if game else 0
     difficulty = getattr(game, "bot_difficulty", "medium") if game else "medium"
     labels = {"easy":"🟢 Легко", "medium":"🟡 Средне", "hard":"🔴 Сложно"}
-    await message.answer(f"🤖 <b>БОТЫ</b>\n\nКоличество: <b>{count}</b>\nСложность: <b>{labels.get(difficulty, difficulty)}</b>\n\nДля изменения используйте кнопку <b>🤖 БОТЫ</b> в лобби.", parse_mode="HTML")
+    await message.answer(bots_text(game or Game(chat_id, message.from_user.id, message.chat.title or "MAFIA")), reply_markup=bots_keyboard(chat_id), parse_mode="HTML")
 
 @dp.message(Command("bots_off"))
 async def bots_off_command(message: Message, bot: Bot):
@@ -308,13 +352,7 @@ async def bots_off_command(message: Message, bot: Bot):
         await message.reply("⚠️ Игра уже началась.", parse_mode="HTML")
         return
     if game:
-        game.bot_count = 0
-        for uid in list(game.players):
-            if uid < 0:
-                game.players.remove(uid)
-                game.player_names.pop(uid, None)
-                if hasattr(game, "player_usernames"):
-                    game.player_usernames.pop(uid, None)
+        sync_bots(game, 0)
         await update_main_game_message(bot, game)
     await message.reply("🤖 <b>Боты отключены.</b>", parse_mode="HTML")
 
@@ -402,6 +440,63 @@ async def join_game_handler(callback: CallbackQuery, bot: Bot):
     await callback.message.edit_text(get_lobby_text(game), reply_markup=lobby_keyboard(True, game.can_start()), parse_mode="HTML")
     await callback.answer("🎮 Вы присоединились!")
 
+
+@dp.callback_query(F.data == "bots")
+async def bots_handler(callback: CallbackQuery, bot: Bot):
+    if not callback.message: return
+    chat_id = callback.message.chat.id
+    if not await is_group_admin(bot, chat_id, callback.from_user.id):
+        await callback.answer("⚠️ Только администратор.", show_alert=True); return
+    game = games.get(chat_id)
+    if not game or game.started:
+        await callback.answer("⚠️ Ботов можно настраивать только в лобби.", show_alert=True); return
+    await callback.message.edit_text(bots_text(game), reply_markup=bots_keyboard(chat_id), parse_mode="HTML")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("bot_count:"))
+async def bot_count_handler(callback: CallbackQuery, bot: Bot):
+    try: _, chat_s, count_s = callback.data.split(":"); chat_id=int(chat_s); count=int(count_s)
+    except Exception: await callback.answer("❌ Некорректная настройка.", show_alert=True); return
+    if not await is_group_admin(bot, chat_id, callback.from_user.id):
+        await callback.answer("⚠️ Только администратор.", show_alert=True); return
+    game=games.get(chat_id)
+    if not game or game.started: await callback.answer("⚠️ Игра уже началась.", show_alert=True); return
+    sync_bots(game, count)
+    await callback.message.edit_text(get_lobby_text(game), reply_markup=lobby_keyboard(True, game.can_start()), parse_mode="HTML")
+    await callback.answer(f"🤖 Ботов: {game.bot_count}")
+
+@dp.callback_query(F.data.startswith("bot_diff:"))
+async def bot_diff_handler(callback: CallbackQuery, bot: Bot):
+    try: _, chat_s, diff = callback.data.split(":"); chat_id=int(chat_s)
+    except Exception: await callback.answer("❌ Некорректная настройка.", show_alert=True); return
+    if not await is_group_admin(bot, chat_id, callback.from_user.id):
+        await callback.answer("⚠️ Только администратор.", show_alert=True); return
+    game=games.get(chat_id)
+    if not game or game.started: await callback.answer("⚠️ Игра уже началась.", show_alert=True); return
+    game.bot_difficulty=diff
+    await callback.message.edit_text(bots_text(game), reply_markup=bots_keyboard(chat_id), parse_mode="HTML")
+    await callback.answer("⚙️ Сложность изменена.")
+
+@dp.callback_query(F.data.startswith("bots_off:"))
+async def bots_off_handler(callback: CallbackQuery, bot: Bot):
+    try: chat_id=int(callback.data.split(":")[1])
+    except Exception: await callback.answer("❌ Некорректная настройка.", show_alert=True); return
+    if not await is_group_admin(bot, chat_id, callback.from_user.id):
+        await callback.answer("⚠️ Только администратор.", show_alert=True); return
+    game=games.get(chat_id)
+    if not game or game.started: await callback.answer("⚠️ Игра уже началась.", show_alert=True); return
+    sync_bots(game, 0)
+    await callback.message.edit_text(get_lobby_text(game), reply_markup=lobby_keyboard(True, game.can_start()), parse_mode="HTML")
+    await callback.answer("🤖 Боты отключены.")
+
+@dp.callback_query(F.data.startswith("bots_back:"))
+async def bots_back_handler(callback: CallbackQuery, bot: Bot):
+    try: chat_id=int(callback.data.split(":")[1])
+    except Exception: await callback.answer("❌ Некорректная настройка.", show_alert=True); return
+    game=games.get(chat_id)
+    if not game: return
+    await callback.message.edit_text(get_lobby_text(game), reply_markup=lobby_keyboard(True, game.can_start()), parse_mode="HTML")
+    await callback.answer()
 
 @dp.callback_query(F.data == "settings")
 async def settings_handler(callback: CallbackQuery, bot: Bot):
