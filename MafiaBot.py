@@ -8,7 +8,7 @@ from collections import Counter
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (Message, CallbackQuery, ChatMemberUpdated, FSInputFile, InputProfilePhotoStatic,
-    BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats)
+    InlineKeyboardMarkup, InlineKeyboardButton, BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats)
 from aiogram.enums import ChatType, ChatMemberStatus
 from dotenv import load_dotenv
 
