@@ -736,29 +736,25 @@ async def _bot_role_action(game: Game, role: str):
 
 
 async def _run_night_role_phase(bot: Bot, game: Game, role: str, status: str):
-    """Run one visible group phase with a private action and a 15-second deadline."""
+    """Run one visible night phase with a guaranteed 15-second countdown.
+
+    The countdown is started BEFORE private-message delivery so a Telegram
+    error (for example, a player has not opened the bot chat) cannot freeze
+    the visible timer or terminate the whole game loop.
+    """
     if not any(game.roles.get(uid) == role and uid in game.alive for uid in game.players):
         return
 
     game.phase = "night"
     game.action_event.clear()
+    seconds = max(0, int(game.night_seconds))
     phase_message = await send_game_message(
-        bot, game, f"{status}\n\n⏱ <b>{game.night_seconds} сек.</b>",
+        bot, game,
+        f"{status}\n\n⏱ <b>{seconds:02d} сек.</b>",
         reply_markup=bot_chat_keyboard(), parse_mode="HTML")
 
-    # Only the currently active human role receives an action interface.
-    for uid in list(game.alive):
-        if is_bot_user(uid) or game.roles.get(uid) != role:
-            continue
-        await send_current_private_action(bot, game, uid)
-
-    # Bots act during exactly the same 15-second phase window.
-    await _bot_role_action(game, role)
-
-    # Таймер запускается отдельной задачей. Поэтому даже если обработчик
-    # действия игрока или Telegram API задержится, видимый отсчёт не зависает.
     async def _phase_timer():
-        deadline = time.monotonic() + max(0, int(game.night_seconds))
+        deadline = time.monotonic() + seconds
         last_remaining = None
         while game.started:
             remaining = max(0, int(deadline - time.monotonic() + 0.999))
@@ -770,18 +766,34 @@ async def _run_night_role_phase(bot: Bot, game: Game, role: str, status: str):
                         text=f"{status}\n\n⏱ <b>{remaining:02d} сек.</b>",
                         reply_markup=bot_chat_keyboard(), parse_mode="HTML")
                 except Exception as error:
-                    # Ошибка обновления текста НЕ останавливает сам таймер.
+                    # Ошибка редактирования сообщения НЕ останавливает отсчёт.
                     print(f"⚠️ Таймер ночного хода ({role}): {type(error).__name__}: {error}")
                 last_remaining = remaining
             if remaining <= 0:
-                return
+                break
             await asyncio.sleep(1)
 
+    # Таймер запускаем первым. Любая ошибка при выдаче личного хода
+    # теперь не может остановить его и весь игровой процесс.
     timer_task = asyncio.create_task(_phase_timer())
     timer_task.add_done_callback(_log_background_task_error)
+
     try:
-        # Ночной этап всегда длится полные 15 секунд. Ход игрока не
-        # обрывает таймер и не переводит игру раньше времени.
+        # Выдаём ход человеку, но ошибка отправки в ЛС является только
+        # проблемой интерфейса этого игрока, а не причиной остановки игры.
+        for uid in list(game.alive):
+            if is_bot_user(uid) or game.roles.get(uid) != role:
+                continue
+            try:
+                await send_current_private_action(bot, game, uid)
+            except Exception as error:
+                print(f"⚠️ Не удалось выдать личный ход {role} игроку {uid}: {type(error).__name__}: {error}")
+                traceback.print_exc()
+
+        # Боты получают ход в том же 15-секундном окне.
+        await _bot_role_action(game, role)
+
+        # Ждём только окончания полного окна. Сделанный ход НЕ обрывает таймер.
         await timer_task
     finally:
         if not timer_task.done():
@@ -791,7 +803,8 @@ async def _run_night_role_phase(bot: Bot, game: Game, role: str, status: str):
             except asyncio.CancelledError:
                 pass
 
-    # If a human did not act, make a safe automatic choice so the game can never hang.
+    # После 15 секунд недостающий ход заполняем автоматически, чтобы игра
+    # гарантированно перешла к следующему этапу.
     await _bot_role_action(game, role)
     if role == MAFIA:
         for uid in game.alive_mafia():
@@ -1042,6 +1055,16 @@ async def conduct_vote(bot: Bot, game: Game, candidates: list[int] | None):
         reply_markup=vote_keyboard(game.chat_id, players), parse_mode="HTML")
     game.vote_message_id = vote_message.message_id
     await send_private_vote_prompts(bot, game, ids)
+
+    # Боты участвуют в голосовании в том же окне, но их автоматический голос
+    # не должен заставлять людей ждать окончания таймера.
+    for voter in alive:
+        if not is_bot_user(voter) or voter in game.day_votes:
+            continue
+        choices = [uid for uid in ids if uid in game.alive and uid != voter]
+        if choices:
+            game.day_votes[voter] = random.choice(choices)
+
     deadline = time.monotonic() + max(0, int(game.vote_seconds))
     game.vote_deadline = deadline
     while game.started:
