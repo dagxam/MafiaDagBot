@@ -510,7 +510,7 @@ async def setting_change_handler(callback: CallbackQuery, bot: Bot):
         try: game.discussion_seconds = int(data.rsplit("_", 1)[1]) * 60
         except ValueError: pass
     elif data in ("setting_lastword_minus", "setting_lastword_plus"):
-        game.last_word_seconds = 15
+        game.last_word_seconds = 10
     game.night_seconds = 15
     await callback.message.edit_text(get_settings_text(game), reply_markup=settings_keyboard(), parse_mode="HTML")
     await callback.answer("⚙️ Настройка изменена.")
@@ -730,7 +730,7 @@ async def _run_night_role_phase(bot: Bot, game: Game, role: str, status: str):
     game.phase = "night"
     game.action_event.clear()
     phase_message = await send_game_message(
-        bot, game, f"{status}\n\n⏱ <b>15 сек.</b>",
+        bot, game, f"{status}\n\n⏱ <b>{game.night_seconds} сек.</b>",
         reply_markup=bot_chat_keyboard(), parse_mode="HTML")
 
     # Only the currently active human role receives an action interface.
@@ -742,7 +742,7 @@ async def _run_night_role_phase(bot: Bot, game: Game, role: str, status: str):
     # Bots act during exactly the same 15-second phase window.
     await _bot_role_action(game, role)
 
-    deadline = time.monotonic() + 15
+    deadline = time.monotonic() + game.night_seconds
     while game.started:
         remaining = max(0, int(deadline - time.monotonic() + 0.999))
         try:
@@ -863,35 +863,38 @@ def resolve_night(game: Game) -> list[int]:
 
 
 async def run_last_word(bot: Bot, game: Game, player_id: int):
-    game.phase = "last_word"
+    # Последнее слово не блокирует игровой цикл: игроку даётся 10 секунд
+    # на сообщение, а игра продолжает следующий этап сразу.
     game.last_word_player = player_id
     game.last_word_text = None
-    game.action_event.clear()
-    await update_main_game_message(bot, game)
+    game.active_last_words.add(player_id)
     message = await send_game_message(
         bot, game,
-        f"🔴 <b>ПОСЛЕДНЕЕ СЛОВО</b>\n\n<b>{safe_name(game, player_id)}</b> может написать последнее слово.\n\n⏱ <b>15 сек.</b>",
+        f"🔴 <b>ПОСЛЕДНЕЕ СЛОВО</b>\n\n<b>{safe_name(game, player_id)}</b> может написать последнее сообщение.\n\n⏱ <b>{game.last_word_seconds} сек.</b>",
         reply_markup=bot_chat_keyboard(), parse_mode="HTML")
-    deadline = time.monotonic() + 15
-    try:
-        while game.started and game.last_word_player == player_id:
-            if game.action_event.is_set():
-                break
-            remaining = max(0, int(deadline - time.monotonic() + 0.999))
-            try:
-                await bot.edit_message_text(
-                    chat_id=game.chat_id, message_id=message.message_id,
-                    text=f"🔴 <b>ПОСЛЕДНЕЕ СЛОВО</b>\n\n<b>{safe_name(game, player_id)}</b> может написать последнее слово.\n\n⏱ <b>{remaining:02d} сек.</b>",
-                    reply_markup=bot_chat_keyboard(), parse_mode="HTML")
-            except Exception:
-                pass
-            if remaining <= 0:
-                break
-            await asyncio.sleep(1)
-    finally:
-        game.last_word_used.add(player_id)
+    asyncio.create_task(_last_word_timer(bot, game, player_id, message.message_id))
+
+
+async def _last_word_timer(bot: Bot, game: Game, player_id: int, message_id: int):
+    deadline = time.monotonic() + game.last_word_seconds
+    while game.started and player_id in game.active_last_words:
+        remaining = max(0, int(deadline - time.monotonic() + 0.999))
+        try:
+            await bot.edit_message_text(
+                chat_id=game.chat_id,
+                message_id=message_id,
+                text=f"🔴 <b>ПОСЛЕДНЕЕ СЛОВО</b>\n\n<b>{safe_name(game, player_id)}</b> может написать последнее сообщение.\n\n⏱ <b>{remaining:02d} сек.</b>",
+                reply_markup=bot_chat_keyboard(),
+                parse_mode="HTML")
+        except Exception:
+            pass
+        if remaining <= 0:
+            break
+        await asyncio.sleep(1)
+    game.active_last_words.discard(player_id)
+    game.last_word_used.add(player_id)
+    if game.last_word_player == player_id:
         game.last_word_player = None
-        game.action_event.clear()
 
 
 
@@ -1318,11 +1321,16 @@ async def group_message_handler(message: Message, bot: Bot):
     if not game:return
     uid=message.from_user.id if message.from_user else None
     if uid is None:return
-    if game.started and game.phase=="last_word" and uid==game.last_word_player and message.text:
+    if game.started and uid in game.active_last_words and message.text:
         text=message.text
         await delete_message_safe(bot,message.chat.id,message.message_id)
         await send_game_message(bot,game,f"🔴 <b>ПОСЛЕДНЕЕ СЛОВО</b>\n\n👤 <b>{safe_name(game,uid)}</b>\n\n«{html.escape(text)}»",parse_mode="HTML")
-        game.action_event.set();return
+        game.last_word_text = text
+        game.active_last_words.discard(uid)
+        game.last_word_used.add(uid)
+        if game.last_word_player == uid:
+            game.last_word_player = None
+        return
     if game.started and uid in game.players and uid not in game.alive:
         await delete_message_safe(bot,message.chat.id,message.message_id)
 
