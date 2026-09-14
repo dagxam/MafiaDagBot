@@ -755,22 +755,41 @@ async def _run_night_role_phase(bot: Bot, game: Game, role: str, status: str):
     # Bots act during exactly the same 15-second phase window.
     await _bot_role_action(game, role)
 
-    deadline = time.monotonic() + game.night_seconds
-    while game.started:
-        remaining = max(0, int(deadline - time.monotonic() + 0.999))
-        try:
-            await bot.edit_message_text(
-                chat_id=game.chat_id,
-                message_id=phase_message.message_id,
-                text=f"{status}\n\n⏱ <b>{remaining:02d} сек.</b>",
-                reply_markup=bot_chat_keyboard(), parse_mode="HTML")
-        except Exception:
-            pass
-        # Таймер ночного хода всегда доходит до 0.
-        # Выбор игрока не обрывает видимый отсчёт раньше времени.
-        if remaining <= 0:
-            break
-        await asyncio.sleep(1)
+    # Таймер запускается отдельной задачей. Поэтому даже если обработчик
+    # действия игрока или Telegram API задержится, видимый отсчёт не зависает.
+    async def _phase_timer():
+        deadline = time.monotonic() + max(0, int(game.night_seconds))
+        last_remaining = None
+        while game.started:
+            remaining = max(0, int(deadline - time.monotonic() + 0.999))
+            if remaining != last_remaining:
+                try:
+                    await bot.edit_message_text(
+                        chat_id=game.chat_id,
+                        message_id=phase_message.message_id,
+                        text=f"{status}\n\n⏱ <b>{remaining:02d} сек.</b>",
+                        reply_markup=bot_chat_keyboard(), parse_mode="HTML")
+                except Exception as error:
+                    # Ошибка обновления текста НЕ останавливает сам таймер.
+                    print(f"⚠️ Таймер ночного хода ({role}): {type(error).__name__}: {error}")
+                last_remaining = remaining
+            if remaining <= 0:
+                return
+            await asyncio.sleep(1)
+
+    timer_task = asyncio.create_task(_phase_timer())
+    timer_task.add_done_callback(_log_background_task_error)
+    try:
+        # Ночной этап всегда длится полные 15 секунд. Ход игрока не
+        # обрывает таймер и не переводит игру раньше времени.
+        await timer_task
+    finally:
+        if not timer_task.done():
+            timer_task.cancel()
+            try:
+                await timer_task
+            except asyncio.CancelledError:
+                pass
 
     # If a human did not act, make a safe automatic choice so the game can never hang.
     await _bot_role_action(game, role)
@@ -1030,15 +1049,25 @@ async def conduct_vote(bot: Bot, game: Game, candidates: list[int] | None):
         minutes, secs = divmod(remaining, 60)
         try:
             await bot.edit_message_text(
-                chat_id=game.chat_id, message_id=vote_message.message_id,
+                chat_id=game.chat_id, message_id=game.vote_message_id,
                 text=get_vote_live_text(game, ids) + f"\n\n⏱ <b>00:{secs:02d}</b>",
                 reply_markup=vote_keyboard(game.chat_id, players), parse_mode="HTML")
-        except Exception:
-            pass
-        # Таймер голосования всегда доходит до 0.
+        except Exception as error:
+            print(f"⚠️ Таймер голосования: {type(error).__name__}: {error}")
+
+        # Если все живые игроки уже подтвердили голоса, голосование
+        # заканчивается немедленно — не ждём оставшиеся секунды.
+        if game.all_day_votes_complete():
+            break
         if remaining <= 0:
             break
-        await asyncio.sleep(1)
+        try:
+            await asyncio.wait_for(game.action_event.wait(), timeout=1.0)
+        except asyncio.TimeoutError:
+            pass
+        # Событие могло быть установлено подтверждением последнего голоса.
+        if game.all_day_votes_complete():
+            break
     alive = game.alive_players()
     for voter in alive:
         if voter not in game.day_votes:
