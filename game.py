@@ -41,6 +41,7 @@ class Game:
     day_number: int = 0
     last_word_player: int | None = None
     last_word_text: str | None = None
+    active_last_words: set[int] = field(default_factory=set)
     mafia_votes: dict[int, int] = field(default_factory=dict)
     doctor_target: int | None = None
     commissioner_target: int | None = None
@@ -79,6 +80,7 @@ class Game:
         self.doctor_healed.clear()
         self.last_word_player = None
         self.last_word_text = None
+        self.active_last_words.clear()
         return True
 
     def restart(self) -> bool:
@@ -90,6 +92,7 @@ class Game:
         self.doctor_healed.clear()
         self.last_word_player = None
         self.last_word_text = None
+        self.active_last_words.clear()
         self.mafia_votes.clear()
         self.doctor_target = None
         self.commissioner_target = None
@@ -115,6 +118,7 @@ class Game:
         self.doctor_healed.clear()
         self.last_word_player = None
         self.last_word_text = None
+        self.active_last_words.clear()
         self.mafia_votes.clear()
         self.doctor_target = None
         self.commissioner_target = None
