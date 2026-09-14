@@ -53,7 +53,7 @@ class Game:
     action_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     discussion_seconds: int = 30
     night_seconds: int = 15
-    last_word_seconds: int = 15
+    last_word_seconds: int = 10
     vote_seconds: int = 10
     bot_count: int = 0
     bot_difficulty: str = "medium"
