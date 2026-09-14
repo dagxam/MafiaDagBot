@@ -724,14 +724,16 @@ async def run_night(bot: Bot, game: Game):
             + ", ".join(safe_name(game, uid) for uid in deaths),
             reply_markup=bot_chat_keyboard(game), parse_mode="HTML",
         )
+        # Последнее слово не блокирует игровой цикл. Для каждого убитого
+        # запускается отдельный 10-секундный таймер, а игра сразу переходит
+        # к следующему этапу. Писать в это окно может только сам убитый.
         for killed in list(deaths):
             if not game.started:
                 return
-            await send_game_message(
-                bot, game, f"🔴 <b>{safe_name(game, killed)}</b> получает последнее слово.",
-                reply_markup=bot_chat_keyboard(game), parse_mode="HTML",
-            )
-            await run_last_word(bot, game, killed)
+            try:
+                await run_last_word(bot, game, killed)
+            except Exception as error:
+                print(f"⚠️ Не удалось открыть последнее слово для {killed}: {type(error).__name__}: {error}")
     else:
         await send_game_message(
             bot, game,
@@ -771,7 +773,7 @@ def _log_background_task_error(task: asyncio.Task):
 
 
 async def run_last_word(bot: Bot, game: Game, player_id: int):
-    """Открыть полноценное 10-секундное окно последнего слова."""
+    """Открывает окно последнего слова только для убитого и не блокирует игру."""
     game.last_word_player = player_id
     game.last_word_text = None
     game.active_last_words.add(player_id)
@@ -786,8 +788,11 @@ async def run_last_word(bot: Bot, game: Game, player_id: int):
         parse_mode="HTML",
     )
 
-    # Не запускаем следующий этап, пока 10-секундное окно не закончится.
-    await _last_word_timer(bot, game, player_id, message.message_id)
+    # Таймер живёт отдельно: переход к дню/следующему кругу не ждёт его.
+    timer_task = asyncio.create_task(
+        _last_word_timer(bot, game, player_id, message.message_id)
+    )
+    timer_task.add_done_callback(_log_background_task_error)
 
 
 async def _last_word_timer(bot: Bot, game: Game, player_id: int, message_id: int):
@@ -864,6 +869,17 @@ async def send_private_vote_prompts(bot: Bot, game: Game, candidates: list[int])
                 reply_markup=vote_keyboard(game.chat_id, choices), parse_mode="HTML")
         except Exception:
             pass
+
+
+async def publish_vote_results(bot: Bot, game: Game):
+    """Показывает результат голосования обычным сообщением в группе."""
+    if not game.day_votes:
+        return
+    counts = Counter(game.day_votes.values())
+    lines = ["🗳 <b>РЕЗУЛЬТАТЫ ГОЛОСОВАНИЯ</b>"]
+    for target_id, count in sorted(counts.items(), key=lambda item: (-item[1], safe_name(game, item[0]))):
+        lines.append(f"\n👤 <b>{safe_name(game, target_id)}</b> — {count}")
+    await send_game_message(bot, game, "\n".join(lines), parse_mode="HTML")
 
 
 async def conduct_vote(bot: Bot, game: Game, candidates: list[int] | None):
