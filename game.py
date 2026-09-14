@@ -56,8 +56,6 @@ class Game:
     night_seconds: int = 15
     last_word_seconds: int = 10
     vote_seconds: int = 10
-    bot_count: int = 0
-    bot_difficulty: str = "medium"
     MIN_PLAYERS = 4
 
     def add_player(self, user_id: int) -> bool:
