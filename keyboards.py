@@ -60,6 +60,7 @@ def vote_keyboard(chat_id: int, players: list[tuple[int, str]], selected_id: int
         display = name if len(name) <= 28 else name[:25] + "..."
         marker = "✅ " if selected_id == user_id else ""
         buttons.append([InlineKeyboardButton(text=f"{marker}🗳 {display}", callback_data=f"vote:{chat_id}:{user_id}")])
+    buttons.append([InlineKeyboardButton(text="✅ ПОДТВЕРДИТЬ ГОЛОС", callback_data=f"vote_confirm:{chat_id}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
