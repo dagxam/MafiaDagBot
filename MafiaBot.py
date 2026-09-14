@@ -863,8 +863,7 @@ def resolve_night(game: Game) -> list[int]:
 
 
 async def run_last_word(bot: Bot, game: Game, player_id: int):
-    # Последнее слово не блокирует игровой цикл: игроку даётся 10 секунд
-    # на сообщение, а игра продолжает следующий этап сразу.
+    """Open a 10-second last-word window without blocking the game loop."""
     game.last_word_player = player_id
     game.last_word_text = None
     game.active_last_words.add(player_id)
@@ -872,43 +871,61 @@ async def run_last_word(bot: Bot, game: Game, player_id: int):
         bot, game,
         f"🔴 <b>ПОСЛЕДНЕЕ СЛОВО</b>\n\n<b>{safe_name(game, player_id)}</b> может написать последнее сообщение.\n\n⏱ <b>{game.last_word_seconds} сек.</b>",
         reply_markup=bot_chat_keyboard(), parse_mode="HTML")
+    # The timer is deliberately detached: the next game phase starts immediately.
     asyncio.create_task(_last_word_timer(bot, game, player_id, message.message_id))
 
 
 async def _last_word_timer(bot: Bot, game: Game, player_id: int, message_id: int):
-    deadline = time.monotonic() + game.last_word_seconds
-    while game.started and player_id in game.active_last_words:
-        remaining = max(0, int(deadline - time.monotonic() + 0.999))
-        try:
-            await bot.edit_message_text(
-                chat_id=game.chat_id,
-                message_id=message_id,
-                text=f"🔴 <b>ПОСЛЕДНЕЕ СЛОВО</b>\n\n<b>{safe_name(game, player_id)}</b> может написать последнее сообщение.\n\n⏱ <b>{remaining:02d} сек.</b>",
-                reply_markup=bot_chat_keyboard(),
-                parse_mode="HTML")
-        except Exception:
-            pass
-        if remaining <= 0:
-            break
-        await asyncio.sleep(1)
-    game.active_last_words.discard(player_id)
-    game.last_word_used.add(player_id)
-    if game.last_word_player == player_id:
-        game.last_word_player = None
+    deadline = time.monotonic() + max(0, int(game.last_word_seconds))
+    try:
+        while game.started and player_id in game.active_last_words:
+            remaining = max(0, int(deadline - time.monotonic() + 0.999))
+            try:
+                await bot.edit_message_text(
+                    chat_id=game.chat_id,
+                    message_id=message_id,
+                    text=(
+                        f"🔴 <b>ПОСЛЕДНЕЕ СЛОВО</b>\n\n"
+                        f"<b>{safe_name(game, player_id)}</b> может написать последнее сообщение.\n\n"
+                        f"⏱ <b>{remaining:02d} сек.</b>"
+                    ),
+                    reply_markup=bot_chat_keyboard(),
+                    parse_mode="HTML")
+            except Exception as error:
+                print(f"⚠️ Таймер последнего слова: {error}")
+            if remaining <= 0:
+                break
+            await asyncio.sleep(1)
+    finally:
+        game.active_last_words.discard(player_id)
+        game.last_word_used.add(player_id)
+        if game.last_word_player == player_id:
+            game.last_word_player = None
 
 
 
 async def run_countdown_message(bot: Bot, game: Game, message, title: str, seconds: int, footer: str = ""):
-    deadline = time.monotonic() + max(0, seconds)
+    """Reliable one-second countdown. Timer completion never blocks the game."""
+    deadline = time.monotonic() + max(0, int(seconds))
+    last_remaining = None
     while game.started:
         remaining = max(0, int(deadline - time.monotonic() + 0.999))
-        minutes, secs = divmod(remaining, 60)
-        timer = f"⏱ <b>{minutes:02d}:{secs:02d}</b>"
-        text = f"{title}\n\n{timer}" + (f"\n\n{footer}" if footer else "")
-        try:
-            await bot.edit_message_text(chat_id=game.chat_id, message_id=message.message_id, text=text, parse_mode="HTML", reply_markup=message.reply_markup)
-        except Exception:
-            pass
+        if remaining != last_remaining:
+            minutes, secs = divmod(remaining, 60)
+            timer = f"⏱ <b>{minutes:02d}:{secs:02d}</b>"
+            text = f"{title}\n\n{timer}" + (f"\n\n{footer}" if footer else "")
+            try:
+                await bot.edit_message_text(
+                    chat_id=game.chat_id,
+                    message_id=message.message_id,
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=message.reply_markup,
+                )
+            except Exception as error:
+                # A Telegram edit failure must not stop the countdown/game loop.
+                print(f"⚠️ Таймер: не удалось обновить сообщение {message.message_id}: {error}")
+            last_remaining = remaining
         if remaining <= 0:
             break
         await asyncio.sleep(1)
@@ -917,7 +934,13 @@ async def run_countdown_message(bot: Bot, game: Game, message, title: str, secon
 async def run_day(bot: Bot, game: Game):
     game.day_number += 1; game.phase = "day_discussion"
     await update_main_game_message(bot, game)
-    message = await send_game_message(bot, game, "☀️ <b>ДЕНЬ</b>\n\n💬 <b>ОБСУЖДЕНИЕ</b>", parse_mode="HTML")
+    try:
+        message = await send_game_message(bot, game, "☀️ <b>ДЕНЬ</b>\n\n💬 <b>ОБСУЖДЕНИЕ</b>", parse_mode="HTML")
+    except Exception as error:
+        print(f"⚠️ Не удалось открыть обсуждение: {error}")
+        # One retry prevents a transient Telegram API failure from killing the game.
+        await asyncio.sleep(1)
+        message = await send_game_message(bot, game, "☀️ <b>ДЕНЬ</b>\n\n💬 <b>ОБСУЖДЕНИЕ</b>", parse_mode="HTML")
     await run_countdown_message(bot, game, message, "☀️ <b>ДЕНЬ</b>\n\n💬 <b>ОБСУЖДЕНИЕ</b>", game.discussion_seconds)
     if not game.started: return
     await conduct_vote(bot, game, None)
@@ -950,7 +973,7 @@ async def send_private_vote_prompts(bot: Bot, game: Game, candidates: list[int])
         try:
             await send_private_game_message(
                 bot, game, voter,
-                "🗳 <b>ГОЛОСОВАНИЕ</b>\n\nВыберите игрока, затем нажмите «ПОДТВЕРДИТЬ ГОЛОС».\n\n⏱ <b>10 секунд</b>",
+                f"🗳 <b>ГОЛОСОВАНИЕ</b>\n\nВыберите игрока, затем нажмите «ПОДТВЕРДИТЬ ГОЛОС».\n\n⏱ <b>{game.vote_seconds} секунд</b>",
                 reply_markup=vote_keyboard(game.chat_id, choices), parse_mode="HTML")
         except Exception:
             pass
@@ -972,7 +995,7 @@ async def conduct_vote(bot: Bot, game: Game, candidates: list[int] | None):
         reply_markup=vote_keyboard(game.chat_id, players), parse_mode="HTML")
     game.vote_message_id = vote_message.message_id
     await send_private_vote_prompts(bot, game, ids)
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + max(0, int(game.vote_seconds))
     game.vote_deadline = deadline
     while game.started:
         remaining = max(0, int(deadline - time.monotonic() + 0.999))
