@@ -172,12 +172,14 @@ def settings_keyboard():
 
 
 def get_settings_text(game: Game) -> str:
+    discussion = (f"{game.discussion_seconds} сек." if game.discussion_seconds < 60
+                  else f"{game.discussion_seconds // 60} мин.")
     return (
         "⚙️ <b>НАСТРОЙКИ</b>\n\n"
-        f"💬 Обсуждение: <b>{game.discussion_seconds // 60} мин.</b>\n"
+        f"💬 Обсуждение: <b>{discussion}</b>\n"
         f"🌙 Ночь: <b>15 сек.</b>\n"
         f"🔴 Последнее слово: <b>{game.last_word_seconds} сек.</b>\n\n"
-        "💬 Время обсуждения можно выбрать: <b>2 / 4 / 6 / 8 / 10 мин.</b>"
+        "💬 После рассвета по умолчанию идёт обсуждение <b>30 сек.</b>, затем голосование."
     )
 
 
@@ -681,52 +683,118 @@ async def run_night_phase_timer(bot: Bot, game: Game, message, seconds: int):
         await asyncio.sleep(1)
 
 
+async def _night_role_done(game: Game, role: str) -> bool:
+    """Return True when the currently active night role has completed its action."""
+    if role == MAFIA:
+        return len(game.mafia_votes) >= len(game.alive_mafia())
+    if role == DOCTOR:
+        doctor = next((uid for uid in game.alive if game.roles.get(uid) == DOCTOR), None)
+        return doctor is None or game.doctor_target is not None or not game.doctor_targets()
+    if role == COMMISSIONER:
+        commissioner = next((uid for uid in game.alive if game.roles.get(uid) == COMMISSIONER), None)
+        return commissioner is None or game.commissioner_target is not None or game.commissioner_kill_target is not None
+    return True
+
+
+async def _bot_role_action(game: Game, role: str):
+    """Bots use the same 15-second phase window as humans, then make one valid action."""
+    if role == MAFIA:
+        for uid in game.alive_mafia():
+            if uid in game.mafia_votes or not is_bot_user(uid):
+                continue
+            targets = [tid for tid in game.alive if game.roles.get(tid) != MAFIA]
+            if targets:
+                game.mafia_votes[uid] = random.choice(targets)
+    elif role == DOCTOR:
+        doctor = next((uid for uid in game.alive if game.roles.get(uid) == DOCTOR), None)
+        if doctor is not None and is_bot_user(doctor) and game.doctor_target is None:
+            targets = game.doctor_targets()
+            if targets:
+                game.doctor_target = random.choice(targets)
+    elif role == COMMISSIONER:
+        commissioner = next((uid for uid in game.alive if game.roles.get(uid) == COMMISSIONER), None)
+        if commissioner is not None and is_bot_user(commissioner) and game.commissioner_target is None and game.commissioner_kill_target is None:
+            targets = [uid for uid in game.alive if uid != commissioner]
+            if targets:
+                if random.choice((True, False)):
+                    game.commissioner_target = random.choice(targets)
+                else:
+                    game.commissioner_kill_target = random.choice(targets)
+
+
+async def _run_night_role_phase(bot: Bot, game: Game, role: str, status: str):
+    """Run one visible group phase with a private action and a 15-second deadline."""
+    if not any(game.roles.get(uid) == role and uid in game.alive for uid in game.players):
+        return
+
+    game.phase = "night"
+    game.action_event.clear()
+    phase_message = await send_game_message(
+        bot, game, f"{status}\n\n⏱ <b>15 сек.</b>",
+        reply_markup=bot_chat_keyboard(), parse_mode="HTML")
+
+    # Only the currently active human role receives an action interface.
+    for uid in list(game.alive):
+        if is_bot_user(uid) or game.roles.get(uid) != role:
+            continue
+        await send_current_private_action(bot, game, uid)
+
+    # Bots act during exactly the same 15-second phase window.
+    await _bot_role_action(game, role)
+
+    deadline = time.monotonic() + 15
+    while game.started:
+        remaining = max(0, int(deadline - time.monotonic() + 0.999))
+        try:
+            await bot.edit_message_text(
+                chat_id=game.chat_id,
+                message_id=phase_message.message_id,
+                text=f"{status}\n\n⏱ <b>{remaining:02d} сек.</b>",
+                reply_markup=bot_chat_keyboard(), parse_mode="HTML")
+        except Exception:
+            pass
+        if await _night_role_done(game, role) or remaining <= 0:
+            break
+        await asyncio.sleep(1)
+
+    # If a human did not act, make a safe automatic choice so the game can never hang.
+    await _bot_role_action(game, role)
+    if role == MAFIA:
+        for uid in game.alive_mafia():
+            if uid not in game.mafia_votes:
+                targets = [tid for tid in game.alive if game.roles.get(tid) != MAFIA]
+                if targets:
+                    game.mafia_votes[uid] = random.choice(targets)
+    elif role == DOCTOR:
+        doctor = next((uid for uid in game.alive if game.roles.get(uid) == DOCTOR), None)
+        if doctor is not None and game.doctor_target is None:
+            targets = game.doctor_targets()
+            if targets:
+                game.doctor_target = random.choice(targets)
+    elif role == COMMISSIONER:
+        commissioner = next((uid for uid in game.alive if game.roles.get(uid) == COMMISSIONER), None)
+        if commissioner is not None and game.commissioner_target is None and game.commissioner_kill_target is None:
+            targets = [uid for uid in game.alive if uid != commissioner]
+            if targets:
+                game.commissioner_target = random.choice(targets)
+
+
 async def run_night(bot: Bot, game: Game):
     game.night_number += 1
     game.phase = "night"
     game.reset_night_actions()
     await update_main_game_message(bot, game)
 
-    # Все роли получают свои действия одновременно. Ночь длится ровно один общий лимит — 15 секунд.
-    night_message = await send_game_message(
-        bot, game, "🌙 <b>ГОРОД ЗАСЫПАЕТ</b>\n\n⏱ <b>15 сек.</b>",
-        reply_markup=bot_chat_keyboard(), parse_mode="HTML")
-
-    await _open_night_actions(bot, game)
-    # Один общий таймер ночи. Ждём либо полного выбора всех ночных ролей,
-    # либо истечения 15 секунд. После этого игровой цикл всегда продолжается.
-    timer_task = asyncio.create_task(run_night_phase_timer(bot, game, night_message, 15))
-    try:
-        try:
-            await asyncio.wait_for(game.action_event.wait(), timeout=15)
-        except asyncio.TimeoutError:
-            pass
-    finally:
-        if not timer_task.done():
-            timer_task.cancel()
-        try:
-            await timer_task
-        except (asyncio.CancelledError, Exception):
-            pass
-
-    # Всё, что не выбрано людьми к дедлайну, выбирается автоматически, чтобы цикл никогда не зависал.
-    await _resolve_bot_night_actions(game)
-    if game.started:
-        for uid in game.alive_mafia():
-            if uid not in game.mafia_votes:
-                targets = [tid for tid in game.alive if game.roles.get(tid) != MAFIA]
-                if targets:
-                    game.mafia_votes[uid] = random.choice(targets)
-        doctor = next((uid for uid in game.alive if game.roles.get(uid) == DOCTOR), None)
-        if doctor is not None and game.doctor_target is None:
-            targets = game.doctor_targets()
-            if targets:
-                game.doctor_target = random.choice(targets)
-        commissioner = next((uid for uid in game.alive if game.roles.get(uid) == COMMISSIONER), None)
-        if commissioner is not None and game.commissioner_target is None and game.commissioner_kill_target is None:
-            targets = [uid for uid in game.alive if uid != commissioner]
-            if targets:
-                game.commissioner_kill_target = random.choice(targets)
+    # Ночные ходы идут строго последовательно: мафия → доктор → комиссар.
+    await _run_night_role_phase(bot, game, MAFIA, "🔫 <b>МАФИЯ ВЫШЛА НА ОХОТУ</b>")
+    if not game.started:
+        return
+    await _run_night_role_phase(bot, game, DOCTOR, "💊 <b>ДОКТОР ВЫШЕЛ СПАСТИ</b>")
+    if not game.started:
+        return
+    await _run_night_role_phase(bot, game, COMMISSIONER, "🔎 <b>КОМИССАР ВЫШЕЛ НА ПОИСК МАФИИ</b>")
+    if not game.started:
+        return
 
     deaths = resolve_night(game)
 
@@ -735,8 +803,6 @@ async def run_night(bot: Bot, game: Game):
     if game.commissioner_kill_target is not None and game.commissioner_kill_target in deaths:
         await send_game_message(bot, game, f"🔴 <b>{safe_name(game, game.commissioner_kill_target)}</b> убит(а) комиссаром.", parse_mode="HTML")
 
-    # Личные результаты остаются в чате бота. Для автоматического сообщения Telegram
-    # не предоставляет API callback-alert: всплывающее окно возможно только после нажатия кнопки.
     if game.doctor_target is not None:
         try:
             private_alerts[(game.doctor_target, "healed")] = "💊 ВАС ВЫЛЕЧИЛИ\n\nЭтой ночью доктор выбрал вас для лечения."
@@ -759,23 +825,20 @@ async def run_night(bot: Bot, game: Game):
         except Exception:
             pass
 
-    if not deaths:
+    if deaths:
+        await send_game_message(
+            bot, game,
+            "☀️ <b>ГОРОД ПРОСЫПАЕТСЯ</b>\n\nНочью погибли: " + ", ".join(safe_name(game, uid) for uid in deaths),
+            reply_markup=bot_chat_keyboard(), parse_mode="HTML")
+        for killed in list(deaths):
+            if not game.started:
+                return
+            await send_game_message(bot, game, f"🔴 <b>{safe_name(game, killed)}</b> получает последнее слово.",
+                                    reply_markup=bot_chat_keyboard(), parse_mode="HTML")
+            await run_last_word(bot, game, killed)
+    else:
         await send_game_message(bot, game, "☀️ <b>ГОРОД ПРОСЫПАЕТСЯ</b>\n\nЭтой ночью никто не погиб.",
                                 reply_markup=bot_chat_keyboard(), parse_mode="HTML")
-        return
-
-    await send_game_message(
-        bot, game,
-        "☀️ <b>ГОРОД ПРОСЫПАЕТСЯ</b>\n\nНочью погибли: " + ", ".join(safe_name(game, uid) for uid in deaths),
-        reply_markup=bot_chat_keyboard(), parse_mode="HTML")
-
-    # Последнее слово — максимум 15 секунд. После него цикл всегда продолжается.
-    for killed in list(deaths):
-        if not game.started:
-            return
-        await send_game_message(bot, game, f"🔴 <b>{safe_name(game, killed)}</b> получает последнее слово.",
-                                reply_markup=bot_chat_keyboard(), parse_mode="HTML")
-        await run_last_word(bot, game, killed)
 
 
 def resolve_night(game: Game) -> list[int]:
