@@ -44,8 +44,10 @@ def bot_chat_keyboard(game: Game | None = None):
     """Кнопка перехода в личный чат с ботом."""
     if not BOT_USERNAME:
         return None
-    chat_id = game.chat_id if game is not None else None
-    url = f"https://t.me/{BOT_USERNAME}?start=game_{chat_id}" if chat_id is not None else f"https://t.me/{BOT_USERNAME}"
+    if game is not None:
+        url = f"https://t.me/{BOT_USERNAME}?start=game_{game.chat_id}"
+    else:
+        url = f"https://t.me/{BOT_USERNAME}"
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="💬 ПЕРЕЙТИ В ЧАТ С БОТОМ", url=url)
     ]])
@@ -774,26 +776,15 @@ async def run_last_word(bot: Bot, game: Game, player_id: int):
     game.last_word_text = None
     game.active_last_words.add(player_id)
 
-    try:
-        message = await send_game_message(
-            bot,
-            game,
-            f"🔴 <b>ПОСЛЕДНЕЕ СЛОВО</b>\n\n"
-            f"<b>{safe_name(game, player_id)}</b> может написать последнее сообщение.\n\n"
-            f"⏱ <b>{game.last_word_seconds} сек.</b>",
-            reply_markup=bot_chat_keyboard(game),
-            parse_mode="HTML",
-        )
-    except Exception as error:
-        # Ошибка Telegram при показе окна последнего слова не должна
-        # останавливать игровой цикл.
-        print(f"⚠️ Не удалось открыть окно последнего слова: {type(error).__name__}: {error}")
-        await asyncio.sleep(max(0, int(game.last_word_seconds)))
-        game.active_last_words.discard(player_id)
-        game.last_word_used.add(player_id)
-        if game.last_word_player == player_id:
-            game.last_word_player = None
-        return
+    message = await send_game_message(
+        bot,
+        game,
+        f"🔴 <b>ПОСЛЕДНЕЕ СЛОВО</b>\n\n"
+        f"<b>{safe_name(game, player_id)}</b> может написать последнее сообщение.\n\n"
+        f"⏱ <b>{game.last_word_seconds} сек.</b>",
+        reply_markup=bot_chat_keyboard(game),
+        parse_mode="HTML",
+    )
 
     # Не запускаем следующий этап, пока 10-секундное окно не закончится.
     await _last_word_timer(bot, game, player_id, message.message_id)
@@ -933,13 +924,7 @@ async def conduct_vote(bot: Bot, game: Game, candidates: list[int] | None):
                 elif choices:
                     game.day_votes[voter] = random.choice(choices)
 
-        await send_game_message(
-            bot,
-            game,
-            get_vote_live_text(game, ids),
-            reply_markup=bot_chat_keyboard(game),
-            parse_mode="HTML",
-        )
+        await publish_vote_results(bot, game)
         counts = Counter(game.day_votes.values())
         if not counts:
             return
