@@ -69,12 +69,3 @@ def postgame_keyboard():
         [InlineKeyboardButton(text="🏁 ЗАВЕРШИТЬ ИГРУ", callback_data="postgame_end")],
     ])
 
-
-def private_bot_keyboard(bot_username: str | None):
-    buttons = [[
-        InlineKeyboardButton(text="▶️ ЗАПУСТИТЬ", callback_data="private_launch"),
-        InlineKeyboardButton(text="🔄 РЕСТАРТ", callback_data="private_restart"),
-    ]]
-    if bot_username:
-        buttons.append([InlineKeyboardButton(text="➕ ДОБАВИТЬ В ГРУППУ", url=f"https://t.me/{bot_username}?startgroup=mafia")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
