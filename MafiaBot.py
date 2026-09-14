@@ -40,6 +40,17 @@ async def send_game_message(bot: Bot, game: Game, text: str, **kwargs):
     return message
 
 
+def bot_chat_keyboard(game: Game | None = None):
+    """Кнопка перехода в личный чат с ботом."""
+    if not BOT_USERNAME:
+        return None
+    chat_id = game.chat_id if game is not None else None
+    url = f"https://t.me/{BOT_USERNAME}?start=game_{chat_id}" if chat_id is not None else f"https://t.me/{BOT_USERNAME}"
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="💬 ПЕРЕЙТИ В ЧАТ С БОТОМ", url=url)
+    ]])
+
+
 async def send_private_game_message(bot: Bot, game: Game, user_id: int, text: str, **kwargs):
     message = await bot.send_message(user_id, text, **kwargs)
     private_message_ids.setdefault(game.chat_id, set()).add(message.message_id)
@@ -541,7 +552,7 @@ async def run_reliable_timer(bot: Bot, game: Game, message_id: int, deadline: fl
                         _edit_timer_message(
                             bot, game.chat_id, message_id,
                             text_builder(remaining),
-                            reply_markup_builder(remaining) if reply_markup_builder else bot_chat_keyboard()
+                            reply_markup_builder(remaining) if reply_markup_builder else bot_chat_keyboard(game)
                         )
                     )
                     pending_edit.add_done_callback(_log_background_task_error)
@@ -570,7 +581,7 @@ async def run_night(bot: Bot, game: Game):
         bot,
         game,
         f"🌙 <b>НАСТУПИЛА НОЧЬ</b>\n\n😴 <b>ВСЕ ИГРОКИ СПЯТ</b>\n\n⏱ <b>{seconds:02d} сек.</b>",
-        reply_markup=bot_chat_keyboard(),
+        reply_markup=bot_chat_keyboard(game),
         parse_mode="HTML",
     )
 
@@ -709,21 +720,21 @@ async def run_night(bot: Bot, game: Game):
             bot, game,
             "☀️ <b>ГОРОД ПРОСЫПАЕТСЯ</b>\n\nНочью погибли: "
             + ", ".join(safe_name(game, uid) for uid in deaths),
-            reply_markup=bot_chat_keyboard(), parse_mode="HTML",
+            reply_markup=bot_chat_keyboard(game), parse_mode="HTML",
         )
         for killed in list(deaths):
             if not game.started:
                 return
             await send_game_message(
                 bot, game, f"🔴 <b>{safe_name(game, killed)}</b> получает последнее слово.",
-                reply_markup=bot_chat_keyboard(), parse_mode="HTML",
+                reply_markup=bot_chat_keyboard(game), parse_mode="HTML",
             )
             await run_last_word(bot, game, killed)
     else:
         await send_game_message(
             bot, game,
             "☀️ <b>ГОРОД ПРОСЫПАЕТСЯ</b>\n\nЭтой ночью никто не погиб.",
-            reply_markup=bot_chat_keyboard(), parse_mode="HTML",
+            reply_markup=bot_chat_keyboard(game), parse_mode="HTML",
         )
 
 def resolve_night(game: Game) -> list[int]:
@@ -763,15 +774,26 @@ async def run_last_word(bot: Bot, game: Game, player_id: int):
     game.last_word_text = None
     game.active_last_words.add(player_id)
 
-    message = await send_game_message(
-        bot,
-        game,
-        f"🔴 <b>ПОСЛЕДНЕЕ СЛОВО</b>\n\n"
-        f"<b>{safe_name(game, player_id)}</b> может написать последнее сообщение.\n\n"
-        f"⏱ <b>{game.last_word_seconds} сек.</b>",
-        reply_markup=bot_chat_keyboard(),
-        parse_mode="HTML",
-    )
+    try:
+        message = await send_game_message(
+            bot,
+            game,
+            f"🔴 <b>ПОСЛЕДНЕЕ СЛОВО</b>\n\n"
+            f"<b>{safe_name(game, player_id)}</b> может написать последнее сообщение.\n\n"
+            f"⏱ <b>{game.last_word_seconds} сек.</b>",
+            reply_markup=bot_chat_keyboard(game),
+            parse_mode="HTML",
+        )
+    except Exception as error:
+        # Ошибка Telegram при показе окна последнего слова не должна
+        # останавливать игровой цикл.
+        print(f"⚠️ Не удалось открыть окно последнего слова: {type(error).__name__}: {error}")
+        await asyncio.sleep(max(0, int(game.last_word_seconds)))
+        game.active_last_words.discard(player_id)
+        game.last_word_used.add(player_id)
+        if game.last_word_player == player_id:
+            game.last_word_player = None
+        return
 
     # Не запускаем следующий этап, пока 10-секундное окно не закончится.
     await _last_word_timer(bot, game, player_id, message.message_id)
@@ -911,7 +933,13 @@ async def conduct_vote(bot: Bot, game: Game, candidates: list[int] | None):
                 elif choices:
                     game.day_votes[voter] = random.choice(choices)
 
-        await publish_vote_results(bot, game)
+        await send_game_message(
+            bot,
+            game,
+            get_vote_live_text(game, ids),
+            reply_markup=bot_chat_keyboard(game),
+            parse_mode="HTML",
+        )
         counts = Counter(game.day_votes.values())
         if not counts:
             return
@@ -922,7 +950,7 @@ async def conduct_vote(bot: Bot, game: Game, candidates: list[int] | None):
             await send_game_message(
                 bot, game,
                 "⚖️ <b>НИЧЬЯ</b>\n\nРешающее голосование между лидерами.",
-                reply_markup=bot_chat_keyboard(), parse_mode="HTML",
+                reply_markup=bot_chat_keyboard(game), parse_mode="HTML",
             )
             await conduct_vote(bot, game, leaders)
             return
@@ -983,9 +1011,9 @@ async def handle_private_target(callback: CallbackQuery, role: str):
     await callback.answer()
     try:
         if role == MAFIA:
-            await send_game_message(bot, game, "🔫 <b>МАФИЯ ВЫБИРАЕТ ЖЕРТВУ.</b>", reply_markup=bot_chat_keyboard(), parse_mode="HTML")
+            await send_game_message(bot, game, "🔫 <b>МАФИЯ ВЫБИРАЕТ ЖЕРТВУ.</b>", reply_markup=bot_chat_keyboard(game), parse_mode="HTML")
         else:
-            await send_game_message(bot, game, "💊 <b>ДОКТОР ВЫБИРАЕТ, КОГО СПАСТИ.</b>", reply_markup=bot_chat_keyboard(), parse_mode="HTML")
+            await send_game_message(bot, game, "💊 <b>ДОКТОР ВЫБИРАЕТ, КОГО СПАСТИ.</b>", reply_markup=bot_chat_keyboard(game), parse_mode="HTML")
     except Exception as error:
         print(f"⚠️ Не удалось показать подтверждение ночного хода: {type(error).__name__}: {error}")
     if game.night_actions_complete():
@@ -1034,7 +1062,7 @@ async def commissioner_target_handler(callback: CallbackQuery, bot: Bot):
     if game.night_actions_complete():
         game.action_event.set()
     try:
-        await send_game_message(bot, game, "🔎 <b>КОМИССАР ВЫШЕЛ НА ПОИСКИ МАФИИ.</b>", reply_markup=bot_chat_keyboard(), parse_mode="HTML")
+        await send_game_message(bot, game, "🔎 <b>КОМИССАР ВЫШЕЛ НА ПОИСКИ МАФИИ.</b>", reply_markup=bot_chat_keyboard(game), parse_mode="HTML")
     except Exception as error:
         print(f"⚠️ Не удалось показать подтверждение хода комиссара: {type(error).__name__}: {error}")
     await callback.answer()
@@ -1054,7 +1082,7 @@ async def commissioner_kill_handler(callback: CallbackQuery, bot: Bot):
     if game.night_actions_complete():
         game.action_event.set()
     try:
-        await send_game_message(bot, game, "☠️ <b>КОМИССАР ХОЧЕТ УБИТЬ.</b>", reply_markup=bot_chat_keyboard(), parse_mode="HTML")
+        await send_game_message(bot, game, "☠️ <b>КОМИССАР ХОЧЕТ УБИТЬ.</b>", reply_markup=bot_chat_keyboard(game), parse_mode="HTML")
     except Exception as error:
         print(f"⚠️ Не удалось показать подтверждение убийства комиссара: {type(error).__name__}: {error}")
     await callback.answer()
