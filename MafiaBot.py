@@ -865,7 +865,7 @@ async def send_private_vote_prompts(bot: Bot, game: Game, candidates: list[int])
         try:
             await send_private_game_message(
                 bot, game, voter,
-                f"🗳 <b>ГОЛОСОВАНИЕ</b>\n\nВыберите игрока, затем нажмите «ПОДТВЕРДИТЬ ГОЛОС».\n\n⏱ <b>{game.vote_seconds} секунд</b>",
+                f"🗳 <b>ГОЛОСОВАНИЕ</b>\n\nВыберите игрока. Ваш голос сразу будет виден всем в группе.\n\n⏱ <b>{game.vote_seconds} секунд</b>",
                 reply_markup=vote_keyboard(game.chat_id, choices), parse_mode="HTML")
         except Exception:
             pass
@@ -968,11 +968,23 @@ async def conduct_vote(bot: Bot, game: Game, candidates: list[int] | None):
         game.tie_candidates.clear()
         if eliminated in game.alive:
             game.alive.remove(eliminated)
+
         await send_game_message(
             bot, game,
-            f"🔴 <b>{safe_name(game, eliminated)}</b> покидает игру.\n\n🔴 Последнее слово.",
+            f"🔴 <b>{safe_name(game, eliminated)}</b> ВЫГНАН(А) ИЗ ГОРОДА.",
             parse_mode="HTML",
         )
+
+        # Сразу после изгнания проверяем победителя. Если одна из сторон уже
+        # победила, игра завершается немедленно и последнее слово не блокирует
+        # финал. Если победителя ещё нет — игра продолжает следующий этап.
+        winner = game.winner()
+        if winner:
+            await finish_game(bot, game, winner)
+            return
+
+        # Последнее слово работает только как отдельное 10-секундное окно
+        # для изгнанного игрока и не останавливает игровой цикл.
         await run_last_word(bot, game, eliminated)
     finally:
         if not timer_task.done():
@@ -1103,7 +1115,7 @@ async def cancel_action_handler(callback: CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("vote:"))
-async def vote_handler(callback: CallbackQuery):
+async def vote_handler(callback: CallbackQuery, bot: Bot):
     try: _, chat_s, target_s = callback.data.split(":"); chat_id = int(chat_s); target_id = int(target_s)
     except Exception:
         await callback.answer("❌ Некорректное голосование.", show_alert=True); return
@@ -1112,24 +1124,10 @@ async def vote_handler(callback: CallbackQuery):
         await callback.answer("❌ Голосование недоступно.", show_alert=True); return
     if target_id == voter:
         await callback.answer("❌ За себя голосовать нельзя.", show_alert=True); return
+    # Выбор сразу становится окончательным голосом — отдельного подтверждения нет.
     game.day_vote_selection[voter] = target_id
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("vote_confirm:"))
-async def vote_confirm_handler(callback: CallbackQuery, bot: Bot):
-    try: chat_id = int(callback.data.split(":")[1])
-    except Exception:
-        await callback.answer("❌ Некорректное голосование.", show_alert=True); return
-    game = games.get(chat_id); voter = callback.from_user.id
-    if not game or game.phase != "day_vote" or voter not in game.alive:
-        await callback.answer("❌ Голосование недоступно.", show_alert=True); return
-    target_id = game.day_vote_selection.get(voter)
-    if target_id is None:
-        await callback.answer("Сначала выберите игрока.", show_alert=True); return
-    if target_id == voter or target_id not in game.alive:
-        await callback.answer("❌ Этот выбор недоступен.", show_alert=True); return
     game.day_votes[voter] = target_id
+
     candidates = [uid for uid in (game.tie_candidates or game.alive_players()) if uid in game.alive]
     if game.vote_message_id:
         try:
@@ -1141,8 +1139,10 @@ async def vote_confirm_handler(callback: CallbackQuery, bot: Bot):
                 reply_markup=vote_keyboard(chat_id, players), parse_mode="HTML")
         except Exception:
             pass
-    await callback.answer(f"✅ Голос подтверждён: {game.player_names.get(target_id, 'Игрок')}")
-    if game.all_day_votes_complete(): game.action_event.set()
+
+    await callback.answer(f"🗳 Вы проголосовали за {game.player_names.get(target_id, 'Игрок')}")
+    if game.all_day_votes_complete():
+        game.action_event.set()
 
 
 async def finish_game(bot: Bot, game: Game, winner: str):
