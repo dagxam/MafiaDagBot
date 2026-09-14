@@ -844,7 +844,7 @@ async def run_night(bot: Bot, game: Game):
     night_message = await send_game_message(
         bot,
         game,
-        f"🌙 <b>НОЧЬ</b>\\n\\n⏱ <b>{seconds:02d} сек.</b>",
+        f"🌙 <b>НОЧЬ</b>\n\n⏱ <b>{seconds:02d} сек.</b>",
         reply_markup=bot_chat_keyboard(),
         parse_mode="HTML",
     )
@@ -862,7 +862,7 @@ async def run_night(bot: Bot, game: Game):
                         bot.edit_message_text(
                             chat_id=game.chat_id,
                             message_id=night_message.message_id,
-                            text=f"🌙 <b>НОЧЬ</b>\\n\\n⏱ <b>{remaining:02d} сек.</b>",
+                            text=f"🌙 <b>НОЧЬ</b>\n\n⏱ <b>{remaining:02d} сек.</b>",
                             reply_markup=bot_chat_keyboard(),
                             parse_mode="HTML",
                         ),
@@ -994,7 +994,7 @@ async def run_night(bot: Bot, game: Game):
     if game.doctor_target is not None:
         try:
             private_alerts[(game.doctor_target, "healed")] = (
-                "💊 ВАС ВЫЛЕЧИЛИ\\n\\nЭтой ночью доктор выбрал вас для лечения."
+                "💊 ВАС ВЫЛЕЧИЛИ\n\nЭтой ночью доктор выбрал вас для лечения."
             )
             await send_private_game_message(
                 bot,
@@ -1010,7 +1010,7 @@ async def run_night(bot: Bot, game: Game):
     if game.mafia_kill_target is not None and game.mafia_kill_target in deaths:
         try:
             private_alerts[(game.mafia_kill_target, "mafia_kill")] = (
-                "🔫 ВАС УБИЛА МАФИЯ\\n\\nЭтой ночью мафия выбрала вас своей жертвой."
+                "🔫 ВАС УБИЛА МАФИЯ\n\nЭтой ночью мафия выбрала вас своей жертвой."
             )
             await send_private_game_message(
                 bot,
@@ -1026,7 +1026,7 @@ async def run_night(bot: Bot, game: Game):
     if game.commissioner_kill_target is not None and game.commissioner_kill_target in deaths:
         try:
             private_alerts[(game.commissioner_kill_target, "commissioner_kill")] = (
-                "☠️ ВАС УБИЛ КОМИССАР\\n\\nЭтой ночью комиссар выбрал вас своей целью."
+                "☠️ ВАС УБИЛ КОМИССАР\n\nЭтой ночью комиссар выбрал вас своей целью."
             )
             await send_private_game_message(
                 bot,
@@ -1043,7 +1043,7 @@ async def run_night(bot: Bot, game: Game):
         await send_game_message(
             bot,
             game,
-            "☀️ <b>ГОРОД ПРОСЫПАЕТСЯ</b>\\n\\nНочью погибли: "
+            "☀️ <b>ГОРОД ПРОСЫПАЕТСЯ</b>\n\nНочью погибли: "
             + ", ".join(safe_name(game, uid) for uid in deaths),
             reply_markup=bot_chat_keyboard(),
             parse_mode="HTML",
@@ -1064,7 +1064,7 @@ async def run_night(bot: Bot, game: Game):
         await send_game_message(
             bot,
             game,
-            "☀️ <b>ГОРОД ПРОСЫПАЕТСЯ</b>\\n\\nЭтой ночью никто не погиб.",
+            "☀️ <b>ГОРОД ПРОСЫПАЕТСЯ</b>\n\nЭтой ночью никто не погиб.",
             reply_markup=bot_chat_keyboard(),
             parse_mode="HTML",
         )
@@ -1110,8 +1110,8 @@ async def run_last_word(bot: Bot, game: Game, player_id: int):
     message = await send_game_message(
         bot,
         game,
-        f"🔴 <b>ПОСЛЕДНЕЕ СЛОВО</b>\\n\\n"
-        f"<b>{safe_name(game, player_id)}</b> может написать последнее сообщение.\\n\\n"
+        f"🔴 <b>ПОСЛЕДНЕЕ СЛОВО</b>\n\n"
+        f"<b>{safe_name(game, player_id)}</b> может написать последнее сообщение.\n\n"
         f"⏱ <b>{game.last_word_seconds} сек.</b>",
         reply_markup=bot_chat_keyboard(),
         parse_mode="HTML",
