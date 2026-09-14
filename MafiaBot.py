@@ -3,6 +3,7 @@ import os
 import html
 import random
 import time
+import traceback
 from collections import Counter
 
 from aiogram import Bot, Dispatcher, F
@@ -573,9 +574,21 @@ async def run_game(bot: Bot, game: Game):
     except asyncio.CancelledError:
         raise
     except Exception as error:
-        print(f"❌ Ошибка игры {game.chat_id}: {error}")
+        # Никогда не скрываем реальную причину в логах Bothost.
+        # Пользовательское сообщение остаётся нейтральным, чтобы не ломать UI игры.
+        print(f"❌ Ошибка игрового процесса {game.chat_id}: {type(error).__name__}: {error}")
+        traceback.print_exc()
         if game.started:
-            await send_game_message(bot, game, "⚠️ Произошла техническая ошибка игрового процесса.")
+            try:
+                await send_game_message(
+                    bot, game,
+                    "⚠️ Произошла техническая ошибка игрового процесса.\n\n"
+                    "🔧 Подробности записаны в журнал бота.",
+                    parse_mode="HTML"
+                )
+            except Exception as notify_error:
+                print(f"❌ Не удалось отправить сообщение об ошибке: {type(notify_error).__name__}: {notify_error}")
+                traceback.print_exc()
 
 
 async def show_role_alert(callback: CallbackQuery, game: Game, user_id: int):
@@ -862,6 +875,16 @@ def resolve_night(game: Game) -> list[int]:
     return list(deaths)
 
 
+def _log_background_task_error(task: asyncio.Task):
+    """Log exceptions from detached timers instead of losing them silently."""
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        print(f"❌ Ошибка фонового таймера: {type(error).__name__}: {error}")
+        traceback.print_exception(type(error), error, error.__traceback__)
+
+
 async def run_last_word(bot: Bot, game: Game, player_id: int):
     """Open a 10-second last-word window without blocking the game loop."""
     game.last_word_player = player_id
@@ -872,7 +895,8 @@ async def run_last_word(bot: Bot, game: Game, player_id: int):
         f"🔴 <b>ПОСЛЕДНЕЕ СЛОВО</b>\n\n<b>{safe_name(game, player_id)}</b> может написать последнее сообщение.\n\n⏱ <b>{game.last_word_seconds} сек.</b>",
         reply_markup=bot_chat_keyboard(), parse_mode="HTML")
     # The timer is deliberately detached: the next game phase starts immediately.
-    asyncio.create_task(_last_word_timer(bot, game, player_id, message.message_id))
+    task = asyncio.create_task(_last_word_timer(bot, game, player_id, message.message_id))
+    task.add_done_callback(_log_background_task_error)
 
 
 async def _last_word_timer(bot: Bot, game: Game, player_id: int, message_id: int):
