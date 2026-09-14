@@ -19,15 +19,6 @@ def admin_game_keyboard(chat_id: int | None = None, bot_username: str | None = N
     buttons = []
     if chat_id is not None:
         buttons.append([InlineKeyboardButton(text="🎭 МОЯ РОЛЬ", callback_data=f"my_role:{chat_id}")])
-        if bot_username:
-            buttons.append([InlineKeyboardButton(text="🎭 МОЙ НОЧНОЙ ХОД", url=f"https://t.me/{bot_username}?start=game_{chat_id}")])
-        else:
-            buttons.append([InlineKeyboardButton(text="🎭 МОЙ НОЧНОЙ ХОД", callback_data=f"my_night:{chat_id}")])
-    buttons.extend([
-        [InlineKeyboardButton(text="⏹ ОСТАНОВИТЬ ИГРУ", callback_data="admin_stop")],
-        [InlineKeyboardButton(text="🔄 РЕСТАРТ ИГРЫ", callback_data="admin_restart")],
-        [InlineKeyboardButton(text="🆕 НОВАЯ ИГРА", callback_data="admin_new_game")],
-    ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
