@@ -1283,23 +1283,109 @@ async def group_message_handler(message: Message, bot: Bot):
 
 async def main():
     global BOT_USERNAME
-    bot=Bot(token=BOT_TOKEN)
-    me=await bot.get_me(); BOT_USERNAME=me.username
-    await bot.set_my_commands([
-        BotCommand(command="mafia", description="Создать новую игру"),
-        BotCommand(command="stop", description="Остановить игру"),
-        BotCommand(command="restart", description="Перезапустить игру"),
-    ], scope=BotCommandScopeAllGroupChats())
-    await bot.set_my_commands([
-        BotCommand(command="start", description="Активировать личный режим"),
-        BotCommand(command="reset", description="Сбросить личный режим"),
-        BotCommand(command="stop", description="Остановить личный режим"),
-    ], scope=BotCommandScopeAllPrivateChats())
-    print("🟢 Mafia Bot запускается...")
-    await setup_bot_avatar(bot)
-    print("🟢 Mafia Bot запущен")
-    try: await dp.start_polling(bot)
-    finally: await bot.session.close()
+
+    print("🟢 Mafia Bot запускается...", flush=True)
+
+    bot = None
+    try:
+        bot = Bot(token=BOT_TOKEN)
+
+        print("🔎 Проверяем подключение к Telegram...", flush=True)
+        me = await bot.get_me()
+        BOT_USERNAME = me.username
+        print(
+            f"✅ Telegram подключён: @{BOT_USERNAME} (ID: {me.id})",
+            flush=True,
+        )
+
+        # Если у бота ранее был установлен webhook, polling не получит обновления.
+        try:
+            await bot.delete_webhook(drop_pending_updates=False)
+            print("✅ Webhook отключён", flush=True)
+        except Exception as error:
+            print(
+                f"⚠️ Не удалось отключить webhook: "
+                f"{type(error).__name__}: {error}",
+                flush=True,
+            )
+
+        # Команды группового чата. Ошибка Telegram здесь не должна останавливать бота.
+        try:
+            await bot.set_my_commands(
+                [
+                    BotCommand(command="mafia", description="Создать новую игру"),
+                    BotCommand(command="stop", description="Остановить игру"),
+                    BotCommand(command="restart", description="Перезапустить игру"),
+                ],
+                scope=BotCommandScopeAllGroupChats(),
+            )
+            print("✅ Команды группы установлены", flush=True)
+        except Exception as error:
+            print(
+                f"⚠️ Не удалось установить команды группы: "
+                f"{type(error).__name__}: {error}",
+                flush=True,
+            )
+
+        # Команды личного чата. Ошибка Telegram здесь тоже не должна останавливать polling.
+        try:
+            await bot.set_my_commands(
+                [
+                    BotCommand(command="start", description="Активировать личный режим"),
+                    BotCommand(command="reset", description="Сбросить личный режим"),
+                    BotCommand(command="stop", description="Остановить личный режим"),
+                ],
+                scope=BotCommandScopeAllPrivateChats(),
+            )
+            print("✅ Команды личного чата установлены", flush=True)
+        except Exception as error:
+            print(
+                f"⚠️ Не удалось установить команды личного чата: "
+                f"{type(error).__name__}: {error}",
+                flush=True,
+            )
+
+        # Установка аватарки не должна блокировать запуск бота.
+        try:
+            await setup_bot_avatar(bot)
+            print("✅ Проверка аватарки завершена", flush=True)
+        except Exception as error:
+            print(
+                f"⚠️ Ошибка установки аватарки: "
+                f"{type(error).__name__}: {error}",
+                flush=True,
+            )
+
+        print("🟢 Mafia Bot запущен", flush=True)
+        print("📡 Ожидание сообщений Telegram...", flush=True)
+
+        try:
+            await dp.start_polling(bot)
+        except Exception as error:
+            print(
+                f"❌ ОШИБКА POLLING: "
+                f"{type(error).__name__}: {error}",
+                flush=True,
+            )
+            traceback.print_exc()
+            raise
+
+    except Exception as error:
+        print(
+            f"❌ КРИТИЧЕСКАЯ ОШИБКА ЗАПУСКА: "
+            f"{type(error).__name__}: {error}",
+            flush=True,
+        )
+        traceback.print_exc()
+        raise
+
+    finally:
+        if bot is not None:
+            try:
+                await bot.session.close()
+            except Exception:
+                pass
 
 
-if __name__=="__main__": asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
