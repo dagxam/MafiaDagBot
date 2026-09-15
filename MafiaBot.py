@@ -320,9 +320,17 @@ async def reset_command(message: Message):
 @dp.message(CommandStart())
 async def start_handler(message: Message):
     bot = message.bot
-    me = await bot.get_me()
     global BOT_USERNAME
-    BOT_USERNAME = me.username
+    # Не делаем лишний getMe() на каждый /start: при временном сетевом
+    # сбое это раньше могло полностью сорвать активацию личного чата.
+    if not BOT_USERNAME:
+        try:
+            me = await bot.get_me()
+            BOT_USERNAME = me.username
+        except Exception as error:
+            print(f"⚠️ Не удалось определить username бота: {type(error).__name__}: {error}")
+            await message.answer("⚠️ Не удалось активировать личный режим. Попробуйте /start ещё раз через несколько секунд.")
+            return
 
     argument = (message.text or "").split(maxsplit=1)[1] if " " in (message.text or "") else ""
     target_game = None
@@ -888,14 +896,32 @@ async def _last_word_timer(bot: Bot, game: Game, player_id: int, message_id: int
 
 
 async def run_countdown_message(bot: Bot, game: Game, message, title: str, seconds: int, footer: str = ""):
-    deadline = time.monotonic() + max(0, int(seconds))
-    await run_reliable_timer(
-        bot, game, message.message_id, deadline,
-        lambda remaining: (
-            f"{title}\n\n⏱ <b>{remaining // 60:02d}:{remaining % 60:02d}</b>"
-            + (f"\n\n{footer}" if footer else "")
-        ),
+    # Отсчёт этапа не зависит от Telegram editMessageText.
+    # Даже если Telegram временно ограничит редактирование таймера,
+    # игровой цикл всё равно перейдёт к следующей фазе точно по дедлайну.
+    seconds = max(0, int(seconds))
+    deadline = time.monotonic() + seconds
+    timer_task = asyncio.create_task(
+        run_reliable_timer(
+            bot, game, message.message_id, deadline,
+            lambda remaining: (
+                f"{title}\n\n⏱ <b>{remaining // 60:02d}:{remaining % 60:02d}</b>"
+                + (f"\n\n{footer}" if footer else "")
+            ),
+        )
     )
+    timer_task.add_done_callback(_log_background_task_error)
+    try:
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+    finally:
+        if not timer_task.done():
+            timer_task.cancel()
+            try:
+                await timer_task
+            except asyncio.CancelledError:
+                pass
 
 
 async def run_day(bot: Bot, game: Game):
@@ -1090,9 +1116,25 @@ async def handle_private_target(callback: CallbackQuery, role: str):
         await callback.answer("❌ Нельзя выбрать союзника.", show_alert=True); return
     if role == DOCTOR and target_id in game.doctor_healed:
         await callback.answer("❌ Этого игрока уже лечили в этой игре.", show_alert=True); return
-    if role == MAFIA: game.mafia_votes[uid] = target_id
-    else: game.doctor_target = target_id
-    await callback.answer("🔫 Цель выбрана." if role == MAFIA else "💊 Игрок выбран.")
+    if role == MAFIA:
+        game.mafia_votes[uid] = target_id
+        icon = "🔫"
+        action_text = "Вы выбрали игрока для убийства"
+    else:
+        game.doctor_target = target_id
+        icon = "💊"
+        action_text = "Вы выбрали игрока для лечения"
+
+    target_name = html.escape(game.player_names.get(target_id, "Игрок"))
+    # После выбора список исчезает: в личном чате остаётся только подтверждение.
+    try:
+        await callback.message.edit_text(
+            f"{icon} <b>ВЫБОР ПРИНЯТ</b>\n\n{action_text}: <b>{target_name}</b>.",
+            parse_mode="HTML",
+        )
+    except Exception as error:
+        print(f"⚠️ Не удалось обновить личный выбор: {type(error).__name__}: {error}")
+    await callback.answer(f"Вы выбрали: {game.player_names.get(target_id, 'Игрок')}")
     if game.night_actions_complete():
         game.action_event.set()
 
@@ -1135,10 +1177,17 @@ async def commissioner_target_handler(callback: CallbackQuery, bot: Bot):
     if game.commissioner_kill_target is not None:
         await callback.answer("❌ Вы уже выбрали убийство. Комиссар может сделать только одно действие за ночь.", show_alert=True); return
     game.commissioner_target=target_id
-    result={MAFIA:"🔴 МАФИЯ", DOCTOR:"💊 ДОКТОР", COMMISSIONER:"🔎 КОМИССАР"}.get(game.roles.get(target_id),"🟢 МИРНЫЙ ЖИТЕЛЬ")
+    target_name = html.escape(game.player_names.get(target_id, "Игрок"))
+    try:
+        await callback.message.edit_text(
+            f"🔎 <b>ВЫБОР ПРИНЯТ</b>\n\nВы выбрали игрока для проверки: <b>{target_name}</b>.",
+            parse_mode="HTML",
+        )
+    except Exception as error:
+        print(f"⚠️ Не удалось обновить выбор комиссара: {type(error).__name__}: {error}")
     if game.night_actions_complete():
         game.action_event.set()
-    await callback.answer("🔎 Игрок выбран для проверки.")
+    await callback.answer(f"Вы выбрали: {game.player_names.get(target_id, 'Игрок')}")
 
 
 
@@ -1152,9 +1201,17 @@ async def commissioner_kill_handler(callback: CallbackQuery, bot: Bot):
     if game.commissioner_target is not None:
         await callback.answer("❌ Вы уже выбрали проверку. Комиссар может сделать только одно действие за ночь.", show_alert=True); return
     game.commissioner_kill_target=target_id
+    target_name = html.escape(game.player_names.get(target_id, "Игрок"))
+    try:
+        await callback.message.edit_text(
+            f"☠️ <b>ВЫБОР ПРИНЯТ</b>\n\nВы выбрали игрока для убийства: <b>{target_name}</b>.",
+            parse_mode="HTML",
+        )
+    except Exception as error:
+        print(f"⚠️ Не удалось обновить выбор комиссара: {type(error).__name__}: {error}")
     if game.night_actions_complete():
         game.action_event.set()
-    await callback.answer("☠️ Цель выбрана.")
+    await callback.answer(f"Вы выбрали: {game.player_names.get(target_id, 'Игрок')}")
 
 
 @dp.callback_query(F.data.startswith("cancel_action:"))
