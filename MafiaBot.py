@@ -32,6 +32,7 @@ game_message_ids: dict[int, set[int]] = {}
 private_message_ids: dict[int, set[int]] = {}
 game_tasks: dict[int, asyncio.Task] = {}
 BOT_USERNAME: str | None = None
+private_activated: set[int] = set()
 
 
 async def send_game_message(bot: Bot, game: Game, text: str, **kwargs):
@@ -212,10 +213,29 @@ async def setup_bot_avatar(bot: Bot):
 # =========================
 
 
+async def bot_has_required_group_rights(bot: Bot, chat_id: int) -> bool:
+    """Бот должен быть администратором и иметь право удалять сообщения."""
+    try:
+        member = await bot.get_chat_member(chat_id=chat_id, user_id=bot.id)
+        return member.status == ChatMemberStatus.ADMINISTRATOR and bool(
+            getattr(member, "can_delete_messages", False)
+        )
+    except Exception as error:
+        print(f"⚠️ Ошибка проверки прав бота {chat_id}: {type(error).__name__}: {error}")
+        return False
+
+
 async def create_lobby_for_group(bot: Bot, message: Message):
     chat_id = message.chat.id
     uid = message.from_user.id
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return False
+    if not await bot_has_required_group_rights(bot, chat_id):
+        await message.reply(
+            "⚠️ <b>Боту нужны права администратора и право удалять сообщения.</b>\n\n"
+            "Выдайте боту эти права и повторите <b>/mafia</b>.",
+            parse_mode="HTML",
+        )
         return False
     if not await is_group_admin(bot, chat_id, uid):
         await message.reply("⚠️ <b>Только администратор группы может начать игру.</b>", parse_mode="HTML")
@@ -290,7 +310,12 @@ async def restart_command(message: Message, bot: Bot):
 @dp.message(Command("reset"))
 async def reset_command(message: Message):
     if message.chat.type == ChatType.PRIVATE:
-        await message.answer("♻️ <b>Личный режим сброшен.</b>\n\nНажмите /start для повторной активации.", parse_mode="HTML")
+        private_activated.discard(message.from_user.id)
+        await message.answer(
+            "♻️ <b>Личный режим сброшен.</b>\n\n"
+            "Нажмите /start для повторной активации.",
+            parse_mode="HTML",
+        )
 
 @dp.message(CommandStart())
 async def start_handler(message: Message):
@@ -301,36 +326,44 @@ async def start_handler(message: Message):
 
     argument = (message.text or "").split(maxsplit=1)[1] if " " in (message.text or "") else ""
     target_game = None
-
     if argument.startswith("game_"):
         try:
             target_game = games.get(int(argument.split("_", 1)[1]))
         except ValueError:
             pass
 
-    # Deep-link из группы: сразу открыть личный ночной ход.
-    # Обычное приветствие при этом не показываем.
-    if target_game and target_game.started and message.from_user.id in target_game.alive and target_game.phase == "night":
+    if (
+        target_game
+        and target_game.started
+        and message.from_user.id in target_game.alive
+        and target_game.phase == "night"
+    ):
+        private_activated.add(message.from_user.id)
         await send_current_private_action(bot, target_game, message.from_user.id)
         return
 
-    # Обычный /start работает только в личном чате.
-    # В группе /start ничего не публикует.
-    if message.chat.type == ChatType.PRIVATE:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(
-                text="➕ ДОБАВИТЬ В ГРУППУ",
-                url=f"https://t.me/{BOT_USERNAME}?startgroup=mafia",
-            )],
-        ])
-        await message.answer(
-            "🎭 <b>MAFIA</b>\n\n"
-            "Личный игровой интерфейс активирован.\n"
-            "Секретные действия и результаты видны только вам.\n\n"
-            "Добавьте бота в группу, чтобы начать игру.",
-            reply_markup=keyboard,
-            parse_mode="HTML",
+    if message.chat.type != ChatType.PRIVATE:
+        return
+
+    user_id = message.from_user.id
+    if user_id in private_activated:
+        return
+
+    private_activated.add(user_id)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="➕ ДОБАВИТЬ В ГРУППУ",
+            url=f"https://t.me/{BOT_USERNAME}?startgroup=mafia",
         )
+    ]])
+    await message.answer(
+        "🎭 <b>MAFIA</b>\n\n"
+        "Личный игровой интерфейс активирован.\n"
+        "Секретные действия и результаты видны только вам.\n\n"
+        "Добавьте бота в группу, чтобы начать игру.",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
 
 
 @dp.my_chat_member()
@@ -338,11 +371,33 @@ async def bot_added_to_group(event: ChatMemberUpdated, bot: Bot):
     chat = event.chat
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
-    if event.new_chat_member.status not in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR):
+
+    old_status = event.old_chat_member.status
+    new_status = event.new_chat_member.status
+    added = old_status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED) and new_status in (
+        ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR
+    )
+    promoted = old_status == ChatMemberStatus.MEMBER and new_status == ChatMemberStatus.ADMINISTRATOR
+    if not (added or promoted):
         return
-    if event.old_chat_member.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
+
+    if not await bot_has_required_group_rights(bot, chat.id):
+        await bot.send_message(
+            chat.id,
+            "⚠️ <b>MAFIA НЕ МОЖЕТ НАЧАТЬ РАБОТУ</b>\n\n"
+            "Для работы игры добавьте боту права <b>администратора</b> "
+            "и обязательно включите право <b>удалять сообщения</b>.\n\n"
+            "После выдачи прав бот автоматически сможет работать.",
+            parse_mode="HTML",
+        )
         return
-    await bot.send_message(chat.id, get_welcome_text(chat.title or "MAFIA"), reply_markup=admin_start_keyboard(), parse_mode="HTML")
+
+    await bot.send_message(
+        chat.id,
+        get_welcome_text(chat.title or "MAFIA"),
+        reply_markup=admin_start_keyboard(),
+        parse_mode="HTML",
+    )
 
 
 @dp.callback_query(F.data == "create_game")
@@ -351,6 +406,9 @@ async def create_game_handler(callback: CallbackQuery, bot: Bot):
         return
     chat_id = callback.message.chat.id
     uid = callback.from_user.id
+    if not await bot_has_required_group_rights(bot, chat_id):
+        await callback.answer("⚠️ Боту нужны права администратора и удаление сообщений.", show_alert=True)
+        return
     if not await is_group_admin(bot, chat_id, uid):
         await callback.answer("⚠️ Только администратор группы.", show_alert=True); return
     if chat_id in games and games[chat_id].started:
@@ -538,58 +596,54 @@ async def send_current_private_action(bot: Bot, game: Game, user_id: int):
 
 
 async def _edit_timer_message(bot: Bot, chat_id: int, message_id: int, text: str, reply_markup=None):
-    """Редактирует таймер независимо от основного игрового цикла."""
     try:
         await asyncio.wait_for(
             bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=text,
-                reply_markup=reply_markup,
-                parse_mode="HTML",
+                chat_id=chat_id, message_id=message_id, text=text,
+                reply_markup=reply_markup, parse_mode="HTML"
             ),
-            timeout=0.5,
+            timeout=1.2,
         )
     except asyncio.TimeoutError:
-        print("⚠️ Таймер: Telegram не ответил за 0.5 сек.; отсчёт продолжается.")
+        print("⚠️ Таймер: Telegram не ответил вовремя; отсчёт продолжается.")
     except Exception as error:
-        print(f"⚠️ Таймер: {type(error).__name__}: {error}")
+        if "message is not modified" in str(error).lower():
+            return
+        retry_after = getattr(error, "retry_after", None)
+        if retry_after is not None:
+            print(f"⚠️ Таймер: Telegram попросил подождать {retry_after} сек.; отсчёт продолжается.")
+        else:
+            print(f"⚠️ Таймер: {type(error).__name__}: {error}")
 
 
 async def run_reliable_timer(bot: Bot, game: Game, message_id: int, deadline: float, text_builder, reply_markup_builder=None):
-    """Таймер с абсолютным дедлайном. Сетевые задержки не останавливают тик."""
+    """Точный таймер по monotonic clock без спама EditMessageText."""
     loop = asyncio.get_running_loop()
-    next_tick = loop.time()
-    last_remaining = None
+    update_interval = 3.0
+    next_update = loop.time()
+    last_shown = None
     pending_edit = None
     try:
         while game.started:
-            now = time.monotonic()
-            remaining = max(0, int(deadline - now + 0.999))
-            if remaining != last_remaining:
-                # Отправляем редактирование отдельной задачей: даже если Telegram
-                # зависнет/замедлится, сам отсчёт продолжает идти по monotonic clock.
+            remaining = max(0, int(deadline - time.monotonic() + 0.999))
+            now = loop.time()
+            if last_shown is None or remaining <= 0 or now >= next_update:
                 if pending_edit is None or pending_edit.done():
                     pending_edit = asyncio.create_task(
                         _edit_timer_message(
-                            bot, game.chat_id, message_id,
-                            text_builder(remaining),
+                            bot, game.chat_id, message_id, text_builder(remaining),
                             reply_markup_builder(remaining) if reply_markup_builder else bot_chat_keyboard(game)
                         )
                     )
                     pending_edit.add_done_callback(_log_background_task_error)
-                last_remaining = remaining
+                    last_shown = remaining
+                    next_update = now + update_interval
             if remaining <= 0:
                 break
-            next_tick += 0.1
-            delay = max(0.01, next_tick - loop.time())
-            await asyncio.sleep(delay)
+            await asyncio.sleep(0.2)
     finally:
         if pending_edit is not None and not pending_edit.done():
-            try:
-                await asyncio.wait_for(pending_edit, timeout=0.6)
-            except Exception:
-                pending_edit.cancel()
+            pending_edit.cancel()
 
 async def run_night(bot: Bot, game: Game):
     """Единое ночное окно для всех живых ночных ролей."""
@@ -678,45 +732,38 @@ async def run_night(bot: Bot, game: Game):
         return
 
     deaths = resolve_night(game)
+    mafia_target = game.mafia_kill_target
+    mafia_saved = mafia_target is not None and mafia_target not in deaths and game.doctor_target == mafia_target
 
-    if game.mafia_kill_target is not None and game.mafia_kill_target in deaths:
-        await send_game_message(bot, game, f"🔴 <b>{safe_name(game, game.mafia_kill_target)}</b> убит(а) мафией.", parse_mode="HTML")
-    if game.commissioner_kill_target is not None and game.commissioner_kill_target in deaths:
-        await send_game_message(bot, game, f"🔴 <b>{safe_name(game, game.commissioner_kill_target)}</b> убит(а) комиссаром.", parse_mode="HTML")
-
-    # Все результаты ночных действий приходят обычными личными сообщениями,
-    # без кнопки «Показать уведомление» и без callback-alert.
-    if game.doctor_target is not None:
+    if mafia_target is not None:
         try:
-            await send_private_game_message(
-                bot, game, game.doctor_target,
-                "💊 <b>ВАС ВЫЛЕЧИЛИ</b>\n\nЭтой ночью доктор выбрал вас для лечения.",
-                parse_mode="HTML",
-            )
+            if mafia_saved:
+                await send_private_game_message(
+                    bot, game, mafia_target,
+                    "💊 <b>ВАС ХОТЕЛА УБИТЬ МАФИЯ, НО ДОКТОР ВАС СПАС.</b>\n\n"
+                    "Этой ночью мафия выбрала вас своей жертвой, но доктор успел вас спасти.",
+                    parse_mode="HTML",
+                )
+            elif mafia_target in deaths:
+                await send_private_game_message(
+                    bot, game, mafia_target,
+                    "🔫 <b>ВАС УБИЛА МАФИЯ.</b>\n\n"
+                    "Этой ночью мафия выбрала вас своей жертвой.",
+                    parse_mode="HTML",
+                )
         except Exception as error:
-            print(f"⚠️ Не удалось отправить сообщение о лечении: {type(error).__name__}: {error}")
-
-    if game.mafia_kill_target is not None and game.mafia_kill_target in deaths:
-        try:
-            await send_private_game_message(
-                bot, game, game.mafia_kill_target,
-                "🔫 <b>ВАС УБИЛА МАФИЯ</b>\n\nЭтой ночью мафия выбрала вас своей жертвой.",
-                parse_mode="HTML",
-            )
-        except Exception as error:
-            print(f"⚠️ Не удалось отправить сообщение о смерти: {type(error).__name__}: {error}")
+            print(f"⚠️ Не удалось отправить результат хода мафии: {type(error).__name__}: {error}")
 
     if game.commissioner_kill_target is not None and game.commissioner_kill_target in deaths:
         try:
             await send_private_game_message(
                 bot, game, game.commissioner_kill_target,
-                "☠️ <b>ВАС УБИЛ КОМИССАР</b>\n\nЭтой ночью комиссар выбрал вас своей целью.",
+                "☠️ <b>ВАС УБИЛ КОМИССАР.</b>\n\nЭтой ночью комиссар выбрал вас своей целью.",
                 parse_mode="HTML",
             )
         except Exception as error:
-            print(f"⚠️ Не удалось отправить сообщение об убийстве комиссара: {type(error).__name__}: {error}")
+            print(f"⚠️ Не удалось отправить результат убийства комиссара: {type(error).__name__}: {error}")
 
-    # Результат проверки комиссара остаётся секретным и приходит только ему сообщением.
     if game.commissioner_target is not None:
         checked = game.commissioner_target
         result = {
@@ -729,7 +776,7 @@ async def run_night(bot: Bot, game: Game):
             try:
                 await send_private_game_message(
                     bot, game, commissioner,
-                    f"🔎 <b>РЕЗУЛЬТАТ ПРОВЕРКИ</b>\n\n"
+                    "🔎 <b>РЕЗУЛЬТАТ ПРОВЕРКИ</b>\n\n"
                     f"Игрок: <b>{safe_name(game, checked)}</b>\n"
                     f"Результат: <b>{result}</b>",
                     parse_mode="HTML",
@@ -738,15 +785,21 @@ async def run_night(bot: Bot, game: Game):
                 print(f"⚠️ Не удалось отправить результат проверки: {type(error).__name__}: {error}")
 
     if deaths:
+        lines = ["☀️ <b>ГОРОД ПРОСЫПАЕТСЯ</b>", ""]
+        if mafia_target is not None and mafia_target in deaths:
+            lines.append(f"🔫 <b>МАФИЯ УБИЛА {safe_name(game, mafia_target)}.</b>")
+        if (
+            game.commissioner_kill_target is not None
+            and game.commissioner_kill_target in deaths
+            and game.commissioner_kill_target != mafia_target
+        ):
+            lines.append(
+                f"☠️ <b>КОМИССАР УБИЛ {safe_name(game, game.commissioner_kill_target)}.</b>"
+            )
         await send_game_message(
-            bot, game,
-            "☀️ <b>ГОРОД ПРОСЫПАЕТСЯ</b>\n\nНочью погибли: "
-            + ", ".join(safe_name(game, uid) for uid in deaths),
+            bot, game, "\n".join(lines),
             reply_markup=bot_chat_keyboard(game), parse_mode="HTML",
         )
-        # Последнее слово не блокирует игровой цикл. Для каждого убитого
-        # запускается отдельный 10-секундный таймер, а игра сразу переходит
-        # к следующему этапу. Писать в это окно может только сам убитый.
         for killed in list(deaths):
             if not game.started:
                 return
@@ -1039,16 +1092,7 @@ async def handle_private_target(callback: CallbackQuery, role: str):
         await callback.answer("❌ Этого игрока уже лечили в этой игре.", show_alert=True); return
     if role == MAFIA: game.mafia_votes[uid] = target_id
     else: game.doctor_target = target_id
-    name = safe_name(game, target_id)
-    # Сообщение хода оставляем в чате бота, чтобы игрок видел историю действия.
-    await callback.answer()
-    try:
-        if role == MAFIA:
-            await send_game_message(bot, game, "🔫 <b>МАФИЯ ВЫБИРАЕТ ЖЕРТВУ.</b>", reply_markup=bot_chat_keyboard(game), parse_mode="HTML")
-        else:
-            await send_game_message(bot, game, "💊 <b>ДОКТОР ВЫБИРАЕТ, КОГО СПАСТИ.</b>", reply_markup=bot_chat_keyboard(game), parse_mode="HTML")
-    except Exception as error:
-        print(f"⚠️ Не удалось показать подтверждение ночного хода: {type(error).__name__}: {error}")
+    await callback.answer("🔫 Цель выбрана." if role == MAFIA else "💊 Игрок выбран.")
     if game.night_actions_complete():
         game.action_event.set()
 
@@ -1094,11 +1138,7 @@ async def commissioner_target_handler(callback: CallbackQuery, bot: Bot):
     result={MAFIA:"🔴 МАФИЯ", DOCTOR:"💊 ДОКТОР", COMMISSIONER:"🔎 КОМИССАР"}.get(game.roles.get(target_id),"🟢 МИРНЫЙ ЖИТЕЛЬ")
     if game.night_actions_complete():
         game.action_event.set()
-    try:
-        await send_game_message(bot, game, "🔎 <b>КОМИССАР ВЫШЕЛ НА ПОИСКИ МАФИИ.</b>", reply_markup=bot_chat_keyboard(game), parse_mode="HTML")
-    except Exception as error:
-        print(f"⚠️ Не удалось показать подтверждение хода комиссара: {type(error).__name__}: {error}")
-    await callback.answer()
+    await callback.answer("🔎 Игрок выбран для проверки.")
 
 
 
@@ -1114,11 +1154,7 @@ async def commissioner_kill_handler(callback: CallbackQuery, bot: Bot):
     game.commissioner_kill_target=target_id
     if game.night_actions_complete():
         game.action_event.set()
-    try:
-        await send_game_message(bot, game, "☠️ <b>КОМИССАР ХОЧЕТ УБИТЬ.</b>", reply_markup=bot_chat_keyboard(game), parse_mode="HTML")
-    except Exception as error:
-        print(f"⚠️ Не удалось показать подтверждение убийства комиссара: {type(error).__name__}: {error}")
-    await callback.answer()
+    await callback.answer("☠️ Цель выбрана.")
 
 
 @dp.callback_query(F.data.startswith("cancel_action:"))
@@ -1303,109 +1339,23 @@ async def group_message_handler(message: Message, bot: Bot):
 
 async def main():
     global BOT_USERNAME
-
-    print("🟢 Mafia Bot запускается...", flush=True)
-
-    bot = None
-    try:
-        bot = Bot(token=BOT_TOKEN)
-
-        print("🔎 Проверяем подключение к Telegram...", flush=True)
-        me = await bot.get_me()
-        BOT_USERNAME = me.username
-        print(
-            f"✅ Telegram подключён: @{BOT_USERNAME} (ID: {me.id})",
-            flush=True,
-        )
-
-        # Если у бота ранее был установлен webhook, polling не получит обновления.
-        try:
-            await bot.delete_webhook(drop_pending_updates=False)
-            print("✅ Webhook отключён", flush=True)
-        except Exception as error:
-            print(
-                f"⚠️ Не удалось отключить webhook: "
-                f"{type(error).__name__}: {error}",
-                flush=True,
-            )
-
-        # Команды группового чата. Ошибка Telegram здесь не должна останавливать бота.
-        try:
-            await bot.set_my_commands(
-                [
-                    BotCommand(command="mafia", description="Создать новую игру"),
-                    BotCommand(command="stop", description="Остановить игру"),
-                    BotCommand(command="restart", description="Перезапустить игру"),
-                ],
-                scope=BotCommandScopeAllGroupChats(),
-            )
-            print("✅ Команды группы установлены", flush=True)
-        except Exception as error:
-            print(
-                f"⚠️ Не удалось установить команды группы: "
-                f"{type(error).__name__}: {error}",
-                flush=True,
-            )
-
-        # Команды личного чата. Ошибка Telegram здесь тоже не должна останавливать polling.
-        try:
-            await bot.set_my_commands(
-                [
-                    BotCommand(command="start", description="Активировать личный режим"),
-                    BotCommand(command="reset", description="Сбросить личный режим"),
-                    BotCommand(command="stop", description="Остановить личный режим"),
-                ],
-                scope=BotCommandScopeAllPrivateChats(),
-            )
-            print("✅ Команды личного чата установлены", flush=True)
-        except Exception as error:
-            print(
-                f"⚠️ Не удалось установить команды личного чата: "
-                f"{type(error).__name__}: {error}",
-                flush=True,
-            )
-
-        # Установка аватарки не должна блокировать запуск бота.
-        try:
-            await setup_bot_avatar(bot)
-            print("✅ Проверка аватарки завершена", flush=True)
-        except Exception as error:
-            print(
-                f"⚠️ Ошибка установки аватарки: "
-                f"{type(error).__name__}: {error}",
-                flush=True,
-            )
-
-        print("🟢 Mafia Bot запущен", flush=True)
-        print("📡 Ожидание сообщений Telegram...", flush=True)
-
-        try:
-            await dp.start_polling(bot)
-        except Exception as error:
-            print(
-                f"❌ ОШИБКА POLLING: "
-                f"{type(error).__name__}: {error}",
-                flush=True,
-            )
-            traceback.print_exc()
-            raise
-
-    except Exception as error:
-        print(
-            f"❌ КРИТИЧЕСКАЯ ОШИБКА ЗАПУСКА: "
-            f"{type(error).__name__}: {error}",
-            flush=True,
-        )
-        traceback.print_exc()
-        raise
-
-    finally:
-        if bot is not None:
-            try:
-                await bot.session.close()
-            except Exception:
-                pass
+    bot=Bot(token=BOT_TOKEN)
+    me=await bot.get_me(); BOT_USERNAME=me.username
+    await bot.set_my_commands([
+        BotCommand(command="mafia", description="Создать новую игру"),
+        BotCommand(command="stop", description="Остановить игру"),
+        BotCommand(command="restart", description="Перезапустить игру"),
+    ], scope=BotCommandScopeAllGroupChats())
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Активировать личный режим"),
+        BotCommand(command="reset", description="Сбросить личный режим"),
+        BotCommand(command="stop", description="Остановить личный режим"),
+    ], scope=BotCommandScopeAllPrivateChats())
+    print("🟢 Mafia Bot запускается...")
+    await setup_bot_avatar(bot)
+    print("🟢 Mafia Bot запущен")
+    try: await dp.start_polling(bot)
+    finally: await bot.session.close()
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+if __name__=="__main__": asyncio.run(main())
