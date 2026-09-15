@@ -298,19 +298,39 @@ async def start_handler(message: Message):
     me = await bot.get_me()
     global BOT_USERNAME
     BOT_USERNAME = me.username
+
     argument = (message.text or "").split(maxsplit=1)[1] if " " in (message.text or "") else ""
     target_game = None
+
     if argument.startswith("game_"):
         try:
             target_game = games.get(int(argument.split("_", 1)[1]))
         except ValueError:
             pass
+
+    # Deep-link из группы: сразу открыть личный ночной ход.
+    # Обычное приветствие при этом не показываем.
     if target_game and target_game.started and message.from_user.id in target_game.alive and target_game.phase == "night":
         await send_current_private_action(bot, target_game, message.from_user.id)
         return
-    # Обычный /start не открывает служебное окно между ходами.
-    # Ночной интерфейс открывается только через deep-link game_<chat_id>.
-    return
+
+    # Обычный /start работает только в личном чате.
+    # В группе /start ничего не публикует.
+    if message.chat.type == ChatType.PRIVATE:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="➕ ДОБАВИТЬ В ГРУППУ",
+                url=f"https://t.me/{BOT_USERNAME}?startgroup=mafia",
+            )],
+        ])
+        await message.answer(
+            "🎭 <b>MAFIA</b>\n\n"
+            "Личный игровой интерфейс активирован.\n"
+            "Секретные действия и результаты видны только вам.\n\n"
+            "Добавьте бота в группу, чтобы начать игру.",
+            reply_markup=keyboard,
+            parse_mode="HTML",
+        )
 
 
 @dp.my_chat_member()
